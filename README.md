@@ -14,9 +14,9 @@
     python app.py
 ```
 
-## API Endpoints
+# API Endpoints
 
-## Ask a Question
+## 1. Ask a Question
 
 - **Endpoint:** `/ask`
 - **Method:** `POST`
@@ -47,7 +47,7 @@
   }
   ```
 
-### 2. Delete a Chat
+## 2. Delete a Chat
 
 - **Endpoint:** `/delete_chat/<chat_id>`
 - **Method:** `DELETE`
@@ -65,7 +65,7 @@
   }
   ```
 
-### 3. List Chats
+## 3. List Chats
 
 - **Endpoint:** `/list_chats`
 - **Method:** `GET`
@@ -99,7 +99,7 @@
   }
   ```
 
-### 4. Get a Chat
+## 4. Get a Chat
 
 - **Endpoint:** `/get_chat/<chat_id>`
 - **Method:** `GET`
@@ -122,7 +122,7 @@
   }
   ```
 
-### 5. Rename a Chat
+## 5. Rename a Chat
 
 - **Endpoint:** `/rename_chat/<chat_id>`
 - **Method:** `POST`
@@ -147,7 +147,7 @@
   }
   ```
 
-### 6. Get User Chats
+## 6. Get User Chats
 
 - **Endpoint:** `/get_user_chats/<user_id>`
 - **Method:** `GET`
@@ -175,7 +175,7 @@
   }
   ```
 
-### 7. Delete User Chats
+## 7. Delete User Chats
 
 - **Endpoint:** `/delete_user_chats/<user_id>`
 - **Method:** `DELETE`
@@ -191,7 +191,7 @@
   }
   ```
 
-### 8. Update Context with URLs
+## 8. Update Context with URLs
 
 - **Endpoint:** `/api/update_context_url`
 - **Method:** `POST`
