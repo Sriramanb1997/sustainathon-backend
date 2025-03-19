@@ -5,15 +5,13 @@ import uuid
 from datetime import datetime
 
 from utils import retrieve_context
+from db import store_chat, get_chat, list_chats, delete_chat, store_user, get_user, delete_user, store_context, retrieve_context, get_user_chats, rename_chat
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 CHAT_API_URL = "http://localhost:1234/v1/chat/completions"
 MAX_HISTORY = 5  # Configurable conversation history size
-
-# Store multiple chats (chat_id -> {heading, history, created_at})
-chats = {}
 
 # Default system contexts
 system_contexts = [
@@ -23,6 +21,7 @@ system_contexts = [
     {"role": "system", "content": "Always provide sources at the end. Prioritize sourcing research papers and trusted blog sources. No need to provide link to the sources, just mention the source name."},
     {"role": "system", "content": "Summarize using tabular format wherever possible. Use markdown formatting for better readability."},
 ]
+
 
 def generate_heading_from_mistral(prompt):
     """Ask Mistral to generate a chat heading based on the first prompt."""
@@ -40,32 +39,34 @@ def generate_heading_from_mistral(prompt):
     else:
         return "General Conversation"
 
+
 @app.route('/ask', methods=['POST'])
-def ask():
+def ask_question_route():
     try:
-        # Parse input JSON
         data = request.get_json()
-        if "question" not in data:
-            return jsonify({"error": "Missing 'question' field"}), 400
+        args = request.args.to_dict()
+
+        if "question" not in data or "user_id" not in args:
+            return jsonify({"error": "'question' and 'user_id' fields are required"}), 400
 
         user_question = data["question"]
+        user_id = args["user_id"]
         chat_id = data.get("chat_id")
 
-        # If no chat_id, create a new chat session
-        if not chat_id:
-            chat_id = str(uuid.uuid4())  # Generate a unique chat ID
-            heading = generate_heading_from_mistral(user_question)
-            chats[chat_id] = {
-                "heading": heading,
-                "messages": [],
-                "created_at": datetime.utcnow().isoformat()  # Store UTC timestamp
-            }
-
-        # Retrieve chat session
-        chat = chats.get(chat_id)
+        # Fetch existing chat or create a new one
+        chat = get_chat(chat_id) if chat_id else None
 
         if not chat:
-            return jsonify({"error": "Chat ID not found"}), 404
+            chat_id = str(uuid.uuid4())
+            heading = generate_heading_from_mistral(user_question)
+            chat = {
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "heading": heading,
+                "messages": [],
+                "created_at": datetime.utcnow().isoformat()
+            }
+            store_chat(user_id, chat_id, heading, chat["messages"])
 
         # Retrieve chat heading & history
         chat_heading = chat["heading"]
@@ -89,15 +90,25 @@ def ask():
         if response.status_code != 200:
             return jsonify({"error": "Failed to get response", "details": response.text}), response.status_code
 
-        # Get assistant's response
-        assistant_reply = response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+        # Debugging: Print API Response
+        response_json = response.json()
+        print("LM Studio Response:", response_json)
+
+        # Validate response structure
+        choices = response_json.get("choices", [])
+        if not choices or not isinstance(choices, list) or "message" not in choices[0]:
+            return jsonify({"error": "Invalid response from model", "details": str(response_json)}), 500
+
+        assistant_reply = choices[0]["message"].get("content", "")
 
         # Add assistant response to history
         conversation_history.append({"role": "assistant", "content": assistant_reply})
 
-        # Return chat_id, heading, response, and created date
+        store_chat(user_id, chat_id, chat["heading"], conversation_history)
+
         return jsonify({
             "chat_id": chat_id,
+            "user_id": user_id,
             "heading": chat_heading,
             "created_at": chat["created_at"],
             "messages": conversation_history
@@ -106,121 +117,110 @@ def ask():
     except Exception as e:
         return jsonify({"error": "Internal server error", "details": str(e)}), 500
 
+
 @app.route('/delete_chat/<chat_id>', methods=['DELETE'])
-def delete_chat(chat_id):
-    """Delete a specific chat by chat_id."""
-    data = request.get_json()
+def delete_chat_route(chat_id):
+    """Delete a specific chat."""
+    data = request.args.to_dict()
+    if "user_id" not in data:
+        return jsonify({"error": "'user_id' field is required"}), 400
 
-    if not chat_id or chat_id not in chats:
-        return jsonify({"error": "Chat ID not found"}), 404
-
-    del chats[chat_id]  # Remove chat from storage
+    delete_chat(chat_id)
     return jsonify({"message": "Chat deleted successfully"})
 
+
 @app.route('/list_chats', methods=['GET'])
-def list_chats():
+def list_chats_route():
+    """List all chats for a user with filtering, sorting, search, and pagination."""
     try:
+        user_id = request.args.get("user_id")
+        if not user_id:
+            return jsonify({"error": "'user_id' is required"}), 400
+
+        # Get optional query parameters safely
         start_date = request.args.get("start_date")
         end_date = request.args.get("end_date")
-        sort_order = request.args.get("sort_order", "desc").lower()  # Default: descending
-        search_query = request.args.get("search", "").strip().lower()  # Case-insensitive search
+        sort_order = request.args.get("sort_order", "desc").lower()
+        search_query = request.args.get("search", "").strip()
 
-        # Pagination parameters (Optional)
-        page = request.args.get("page")
-        limit = request.args.get("limit")
+        # Ensure `page` and `limit` are integers and handle invalid values
+        try:
+            page = int(request.args.get("page", 1) or 1)
+            limit = int(request.args.get("limit", 10) or 10)
+        except ValueError:
+            return jsonify({"error": "Invalid 'page' or 'limit' value"}), 400
 
-        # Convert to integers if provided
-        page = int(page) if page else None
-        limit = int(limit) if limit else None
-
-        # Convert start/end dates to datetime objects
-        start_dt = datetime.fromisoformat(start_date) if start_date else None
-        end_dt = datetime.fromisoformat(end_date) if end_date else None
-
-        # Filter chats
-        filtered_chats = []
-        for chat_id, chat in chats.items():
-            chat_dt = datetime.fromisoformat(chat["created_at"])
-
-            # Apply date filters
-            if start_dt and chat_dt < start_dt:
-                continue
-            if end_dt and chat_dt > end_dt:
-                continue
-
-            # Apply partial search filter
-            if search_query and search_query not in chat["heading"].lower():
-                continue
-
-            filtered_chats.append({
-                "chat_id": chat_id,
-                "heading": chat["heading"],
-                "created_at": chat["created_at"]
-            })
-
-        # Sort by created_at (asc or desc)
-        filtered_chats.sort(key=lambda x: x["created_at"], reverse=(sort_order == "desc"))
-
-        # Apply pagination only if page & limit are provided
-        total_chats = len(filtered_chats)
-        total_pages = (total_chats + limit - 1) // limit if limit else 1
-
-        if page and limit:
-            start_index = (page - 1) * limit
-            end_index = start_index + limit
-            paginated_chats = filtered_chats[start_index:end_index]
-        else:
-            paginated_chats = filtered_chats  # Return all chats if no pagination
+        # Fetch filtered, sorted, paginated chats
+        chat_data = list_chats(user_id, start_date, end_date, sort_order, search_query, page, limit)
 
         return jsonify({
-            "page": page if page else None,
-            "limit": limit if limit else None,
-            "total_chats": total_chats,
-            "total_pages": total_pages if limit else 1,
-            "chats": paginated_chats
+            "user_id": user_id,
+            "page": page,
+            "limit": limit,
+            **chat_data
         })
 
     except Exception as e:
         return jsonify({"error": "Invalid request", "details": str(e)}), 400
 
+
 @app.route('/get_chat/<chat_id>', methods=['GET'])
-def get_chat(chat_id):
-    """Retrieve a chat by chat_id."""
-    chat = chats.get(chat_id)
-
-    if not chat:
-        return jsonify({"error": "Chat not found"}), 404
-
-    return jsonify({
-        "chat_id": chat_id,
-        "heading": chat["heading"],
-        "messages": chat["messages"],
-        "created_at": chat["created_at"]
-    })
+def get_chat_route(chat_id):
+    """Retrieve a chat by ID."""
+    chat = get_chat(chat_id)
+    return jsonify(chat) if chat else jsonify({"error": "Chat not found"}), 404
 
 
 @app.route('/rename_chat/<chat_id>', methods=['POST'])
-def rename_chat(chat_id):
-    """Rename a chat by chat_id."""
-    chat = chats.get(chat_id)
-
+def rename_chat_route(chat_id):
+    """Rename a chat in ChromaDB."""
     data = request.get_json()
     if "heading" not in data:
         return jsonify({"error": "Missing 'heading' field"}), 400
 
     new_heading = data["heading"]
+    chat = get_chat(chat_id)
 
     if not chat:
-        return jsonify({"error": "Chat not found"}), 404
+        return jsonify({"error": f"No chat found with ID '{chat_id}'"}), 404
 
-    chat["heading"] = new_heading
+    rename_chat(chat_id, new_heading)
+    return jsonify({"chat_id": chat_id, "user_id": chat["user_id"], "heading": new_heading, "created_at": chat["created_at"]})
 
-    return jsonify({
-        "chat_id": chat_id,
-        "heading": chat["heading"],
-        "messages": chat["messages"],
-        "created_at": chat["created_at"]
-    })
+
+
+@app.route('/get_user_chats/<user_id>', methods=['GET'])
+def get_user_chats_route(user_id):
+    """Retrieve all chats for a specific user from ChromaDB."""
+    chats = get_user_chats(user_id)
+    return jsonify({"user_id": user_id, "chats": chats})
+
+
+@app.route('/delete_user_chats/<user_id>', methods=['DELETE'])
+def delete_user_chats_route(user_id):
+    """Delete all chats for a user."""
+    delete_user(user_id)
+    return jsonify({"message": f"All chats deleted for user '{user_id}'"})
+
+
+# Update Context with URLs and ignored keywords while web scraping
+@app.route('/api/update_context_url', methods=['POST'])
+def update_context_url():
+    try:
+        data = request.get_json()
+
+        if "urls" not in data or "ignored_keywords" not in data:
+            return jsonify({"error": "'urls' and 'ignored_keywords' fields are required"}), 400
+
+        urls = data["urls"]
+        ignored_keywords = data["ignored_keywords"]
+
+        # Add your processing logic here.
+
+        return jsonify({"message": f"Received {len(urls)} URLs and {len(ignored_keywords)} ignored keywords for processing."})
+
+    except Exception as e:
+        return jsonify({"error": "Internal server error", "details": str(e)}), 500
 
 
 if __name__ == '__main__':
