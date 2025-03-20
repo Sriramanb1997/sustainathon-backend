@@ -213,12 +213,11 @@ def add_link_api():
     except Exception as e:
         return jsonify({"error": "Failed to save link", "details": str(e)}), 500
 
-@app.route('/link', methods=['DELETE'])
-def delete_link_api():
+@app.route('/link/<link_id>', methods=['DELETE'])
+def delete_link_api(link_id):
     """Retrieve all users."""
     try:
-        data = request.get_json()
-        link = delete_link(data.id)
+        link = delete_link(link_id)
         return jsonify({"link": link, "status" : "ok"})
 
     except Exception as e:

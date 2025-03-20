@@ -14,6 +14,7 @@ users_collection = chroma_client.get_or_create_collection(name="users")
 context_collection = chroma_client.get_or_create_collection(name="context_embeddings")
 link_collection = chroma_client.get_or_create_collection(name="links")
 
+
 # Load Sentence Transformer model for embeddings
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
@@ -189,10 +190,13 @@ def list_links():
 
 def add_link(link):
     try:
+        link_id = str(uuid.uuid4())
+        link['id'] = link_id
+        print(link_id)
         link_collection.add(
-            ids=[str(uuid.uuid4())],
+            ids=[link_id],
             metadatas=[{"created_at": datetime.utcnow().isoformat()}],
-            documents=[link]
+            documents=[str(link)]
         )
     except Exception as e:
         print(f"Error adding link - ", str(e))
