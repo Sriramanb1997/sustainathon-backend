@@ -1,3 +1,4 @@
+# In nilgiri, which ngos are taking care of elephants?
 import chromadb
 from sentence_transformers import SentenceTransformer
 import uuid
@@ -27,15 +28,14 @@ def store_chat(user_id, chat_id, heading, messages):
         chats_collection.update(
             ids=[chat_id],
             metadatas=[{"chat_id": chat_id, "user_id": user_id, "heading": heading, "created_at": datetime.utcnow().isoformat()}],
-            documents=[str(messages)]
+            documents=[json.dumps(messages)]
         )
     else:
         chats_collection.add(
             ids=[chat_id],
             metadatas=[{"chat_id": chat_id, "user_id": user_id, "heading": heading, "created_at": datetime.utcnow().isoformat()}],
-            documents=[str(messages)]
+            documents=[json.dumps(messages)]
         )
-
 
 
 def get_chat(chat_id):
@@ -55,8 +55,7 @@ def get_chat(chat_id):
 
         try:
             # Try parsing normally
-            fixed_data = re.sub(r"(?<=\{|\[|\s)'|(?<=,)'|'(?=\s|:|,|]|})", '"', raw_data)
-            messages = json.loads(fixed_data)
+            messages = json.loads(raw_data)
         except json.JSONDecodeError:
             messages = []  # If decoding still fails, return empty list
 
@@ -227,21 +226,110 @@ def get_user_chats(user_id):
     return list_chats(user_id)  # Simply reuse list_chats()
 
 
-def retrieve_context(query):
+def retrieve_context(query, top_k=5):
     """Retrieve the most relevant context based on similarity search."""
     try:
         query_embedding = embedder.encode(query).tolist()
         results = context_collection.query(
             query_embeddings=[query_embedding],
-            n_results=5,
+            n_results=top_k,
             include=["metadatas"]
         )
 
         if not results or "metadatas" not in results or not results["metadatas"]:
             return ""
 
-        return "\n\n".join([res.get("text", "") for res in results["metadatas"] if "text" in res])
+        return "\n\n".join([res.get("content", "") for res in results["metadatas"][0] if "content" in res])
 
     except Exception as e:
         print(f"Error retrieving context for query '{query}': {str(e)}")
         return ""
+
+
+def delete_context_collection():
+    global context_collection
+    chroma_client.delete_collection(name="context_embeddings")
+    context_collection = chroma_client.create_collection(name="context_embeddings")
+
+
+def get_context_collection_count():
+    return context_collection.count()
+
+
+def store_contexts_objects(text_item):
+    """Read a JSON file and store contexts with embeddings in ChromaDB."""
+    try:
+
+        url = text_item["url"]
+        sanctuary = text_item["sanctuary"]
+        ngos = text_item["ngos"]
+        content = text_item["content"]
+
+        if content == "" or len(content) < 30:
+            return
+
+        combined_content = f" Name of the NGO: {' '.join(ngos)}. URL to the Content which NGO maintains: '{url}'. Sanctuaries which the NGO are maintaining: {' '.join(sanctuary)}. Content of the full page: {content}"
+
+        embedding = embedder.encode(combined_content).tolist()
+        context_collection.add(
+            ids=[str(uuid.uuid4())],
+            metadatas=[{
+                "url": url,
+                "sanctuary": json.dumps(sanctuary),
+                "ngos": json.dumps(ngos),
+                "content": combined_content
+            }],
+            embeddings=[embedding]
+        )
+
+    except FileNotFoundError:
+        return "File not found."
+    except json.JSONDecodeError:
+        return "Invalid JSON format."
+    except Exception as e:
+        return str(e)
+
+
+def store_contexts_from_file(file_path):
+    """Read a JSON file and store contexts with embeddings in ChromaDB."""
+    try:
+        # Open and read the JSON file
+        with open(file_path, 'r') as file:
+            contexts = json.load(file)
+
+        # Ensure contexts is a list
+        if not isinstance(contexts, list):
+            raise ValueError("Invalid data format. Expected an array of objects.")
+
+        # Store each context
+        for context in contexts:
+            url = context.get("url")
+            sanctuary = context.get("sanctuary")
+            ngos = context.get("ngos")
+            content = context.get("content")
+
+            if content == "" or len(content) < 30:
+                continue
+
+            combined_content = f" Name of the NGO: {' '.join(ngos)}. URL to the Content which NGO maintains: '{url}'. Sanctuaries which the NGO are maintaining: {' '.join(sanctuary)}. Content of the full page: {content}"
+
+            embedding = embedder.encode(combined_content).tolist()
+            context_collection.add(
+                ids=[str(uuid.uuid4())],
+                metadatas=[{
+                    "url": url,
+                    "sanctuary": json.dumps(sanctuary),
+                    "ngos": json.dumps(ngos),
+                    "content": combined_content
+                }],
+                embeddings=[embedding]
+            )
+
+        return "Contexts stored successfully."
+
+    except FileNotFoundError:
+        return "File not found."
+    except json.JSONDecodeError:
+        return "Invalid JSON format."
+    except Exception as e:
+        return str(e)
