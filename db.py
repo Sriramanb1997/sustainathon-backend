@@ -12,6 +12,7 @@ chroma_client = chromadb.PersistentClient(path="./chroma_db")
 chats_collection = chroma_client.get_or_create_collection(name="chats")
 users_collection = chroma_client.get_or_create_collection(name="users")
 context_collection = chroma_client.get_or_create_collection(name="context_embeddings")
+link_collection = chroma_client.get_or_create_collection(name="links")
 
 # Load Sentence Transformer model for embeddings
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
@@ -176,6 +177,29 @@ def delete_user(user_id):
     users_collection.delete(ids=[user_id])
     chats_collection.delete(where={"user_id": user_id})
 
+def list_links():
+    """Retrieve all users from the users collection."""
+    try:
+        results = link_collection.get()
+        return results["documents"]
+
+    except Exception as e:
+        print(f"Error retrieving users: {str(e)}")
+        return []
+
+def add_link(link):
+    try:
+        link_collection.add(
+            ids=[str(uuid.uuid4())],
+            metadatas=[{"created_at": datetime.utcnow().isoformat()}],
+            documents=[link]
+        )
+    except Exception as e:
+        print(f"Error adding link - ", str(e))
+        return None
+
+def delete_link(link_id):
+    link_collection.delete(ids=[link_id])
 
 def store_context(link, text):
     """Store context embeddings."""

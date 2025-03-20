@@ -7,7 +7,8 @@ from datetime import datetime
 from authlib.integrations.flask_client import OAuth
 
 from utils import retrieve_context
-from db import store_chat, get_chat, list_chats, delete_chat, store_user, get_user, delete_user, store_context, retrieve_context, get_user_chats, rename_chat, list_users
+from db import store_chat, get_chat, list_chats, delete_chat, store_user, get_user, delete_user, store_context, \
+    retrieve_context, get_user_chats, rename_chat, list_users, list_links, add_link, delete_link
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "http://localhost:5173"}}, supports_credentials=True)
@@ -190,6 +191,38 @@ def list_users_route():
 
     except Exception as e:
         return jsonify({"error": "Failed to retrieve users", "details": str(e)}), 500
+
+@app.route('/links', methods=['GET'])
+def list_links_api():
+    """Retrieve all users."""
+    try:
+        links = list_links()
+        return jsonify({"links": links})
+
+    except Exception as e:
+        return jsonify({"error": "Failed to retrieve links", "details": str(e)}), 500
+
+@app.route('/link', methods=['POST'])
+def add_link_api():
+    """Retrieve all users."""
+    try:
+        data = request.get_json()
+        add_link(data)
+        return jsonify({"status": "ok"})
+
+    except Exception as e:
+        return jsonify({"error": "Failed to save link", "details": str(e)}), 500
+
+@app.route('/link', methods=['DELETE'])
+def delete_link_api():
+    """Retrieve all users."""
+    try:
+        data = request.get_json()
+        link = delete_link(data.id)
+        return jsonify({"link": link, "status" : "ok"})
+
+    except Exception as e:
+        return jsonify({"error": "Failed to delete link", "details": str(e)}), 500
 
 
 @app.route('/list_chats', methods=['GET'])
