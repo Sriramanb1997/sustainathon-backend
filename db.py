@@ -53,14 +53,11 @@ def get_chat(chat_id):
 
         try:
             # Try parsing normally
-            messages = json.loads(raw_data)
+            fixed_data = re.sub(r"(?<=\{|\[|\s)'|(?<=,)'|'(?=\s|:|,|]|})", '"', raw_data)
+            messages = json.loads(fixed_data)
         except json.JSONDecodeError:
-            try:
-                # Fix single quotes: Convert '{'key': 'value'}' → '{"key": "value"}'
-                fixed_data = re.sub(r"(?<!\\)'", '"', raw_data)
-                messages = json.loads(fixed_data)
-            except json.JSONDecodeError:
-                messages = []  # If decoding still fails, return empty list
+            messages = []  # If decoding still fails, return empty list
+
 
     return {
         "chat_id": chat_id,
@@ -128,26 +125,54 @@ def delete_chat(chat_id):
 
 
 def store_user(user_id, user_data):
-    """Store user details in ChromaDB."""
     users_collection.add(
         ids=[user_id],
-        metadatas=[user_data],
+        metadatas=[{
+            "first_name": user_data.get("first_name", ""),
+            "last_name": user_data.get("last_name", ""),
+            "email": user_data.get("email", ""),
+            "user_id": user_id,
+            "profile_picture": user_data.get("profile_picture", "")
+        }],
         documents=["User Data"]
     )
 
 
+def list_users():
+    """Retrieve all users from the users collection."""
+    try:
+        results = users_collection.get()
+        if not results or "metadatas" not in results or not results["metadatas"]:
+            return []
+
+        # Convert to list of user dicts
+        users = [
+            {
+                "user_id": res["user_id"],
+                "first_name": res.get("first_name", ""),
+                "last_name": res.get("last_name", ""),
+                "email": res.get("email", ""),
+                "profile_picture": res.get("profile_picture", "")
+            }
+            for res in results["metadatas"]
+        ]
+
+        return users
+
+    except Exception as e:
+        print(f"Error retrieving users: {str(e)}")
+        return []
+
+
 def get_user(user_id):
-    """Retrieve user details safely."""
     try:
         user = users_collection.get(ids=[user_id])
-        return user.get("metadatas", [{}])[0]  # Ensure safe access
+        return user.get("metadatas", [{}])[0]
     except Exception as e:
         print(f"Error retrieving user {user_id}: {str(e)}")
         return None
 
-
 def delete_user(user_id):
-    """Delete user data and associated chats."""
     users_collection.delete(ids=[user_id])
     chats_collection.delete(where={"user_id": user_id})
 

@@ -1,14 +1,34 @@
-from flask import Flask, request, jsonify
+from flask import Flask, session, request, jsonify, url_for, redirect
 from flask_cors import CORS
 import requests
+import os
 import uuid
 from datetime import datetime
+from authlib.integrations.flask_client import OAuth
 
 from utils import retrieve_context
-from db import store_chat, get_chat, list_chats, delete_chat, store_user, get_user, delete_user, store_context, retrieve_context, get_user_chats, rename_chat
+from db import store_chat, get_chat, list_chats, delete_chat, store_user, get_user, delete_user, store_context, retrieve_context, get_user_chats, rename_chat, list_users
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+CORS(app, resources={r"/*": {"origins": "http://localhost:5173"}}, supports_credentials=True)
+
+app.secret_key = os.urandom(24)
+
+# Google OAuth Configuration
+oauth = OAuth(app)
+google = oauth.register(
+    name='google',
+    client_id='913121818157-fmkruu2cs5qte6narrg43jc3otcgu74t.apps.googleusercontent.com',
+    client_secret='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',
+    access_token_url='https://oauth2.googleapis.com/token',
+    access_token_params=None,
+    authorize_url='https://accounts.google.com/o/oauth2/v2/auth',
+    authorize_params=None,
+    api_base_url='https://www.googleapis.com/oauth2/v2/',
+    client_kwargs={'scope': 'openid email profile'},
+    server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',  # OpenID Connect metadata
+    jwks_uri='https://www.googleapis.com/oauth2/v3/certs'  # Manually set the JWKS URI
+)
 
 CHAT_API_URL = "http://localhost:1234/v1/chat/completions"
 MAX_HISTORY = 5  # Configurable conversation history size
@@ -22,6 +42,38 @@ system_contexts = [
     {"role": "system", "content": "Summarize using tabular format wherever possible. Use markdown formatting for better readability."},
 ]
 
+@app.route('/login')
+def login():
+    redirect_uri = url_for('authorize', _external=True)
+    print(redirect_uri)
+    return google.authorize_redirect(redirect_uri)
+
+@app.route('/authorize')
+def authorize():
+    token = google.authorize_access_token()  # Get the OAuth token
+    user_info = google.get('https://www.googleapis.com/oauth2/v2/userinfo').json()  # Get user info from Google
+
+    user_data = {
+        "first_name": user_info.get('given_name', ''),
+        "last_name": user_info.get('family_name', ''),
+        "email": user_info.get('email', ''),
+        "profile_picture": user_info.get('picture', '')
+    }
+
+    # Store token in session (optional, for future API calls)
+    session['token'] = token
+
+    # Store user data (replace this with actual logic to store in database)
+    user_id = user_info.get('email', '').split('@')[0]  # Using email to generate unique user ID
+    store_user(user_id, user_data)
+
+    # Redirect the user to frontend with user info or token
+    return redirect(f'http://localhost:5173/')
+
+
+@app.route('/user')
+def get_user_route():
+    return jsonify(session.get('user', {}))
 
 def generate_heading_from_mistral(prompt):
     """Ask Mistral to generate a chat heading based on the first prompt."""
@@ -129,6 +181,17 @@ def delete_chat_route(chat_id):
     return jsonify({"message": "Chat deleted successfully"})
 
 
+@app.route('/list_users', methods=['GET'])
+def list_users_route():
+    """Retrieve all users."""
+    try:
+        users = list_users()
+        return jsonify({"users": users})
+
+    except Exception as e:
+        return jsonify({"error": "Failed to retrieve users", "details": str(e)}), 500
+
+
 @app.route('/list_chats', methods=['GET'])
 def list_chats_route():
     """List all chats for a user with filtering, sorting, search, and pagination."""
@@ -168,7 +231,10 @@ def list_chats_route():
 def get_chat_route(chat_id):
     """Retrieve a chat by ID."""
     chat = get_chat(chat_id)
-    return jsonify(chat) if chat else jsonify({"error": "Chat not found"}), 404
+    if chat:
+        return jsonify(chat)
+    else:
+        return jsonify({"error": "Chat not found"}), 404
 
 
 @app.route('/rename_chat/<chat_id>', methods=['POST'])
