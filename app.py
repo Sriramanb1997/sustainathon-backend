@@ -198,18 +198,15 @@ def ask_question_route():
         return jsonify({"error": "Internal server error", "details": str(e)}), 500
 
 
-@app.route('/ask_with_stream', methods=['POST'])
+@app.route('/ask_with_stream', methods=['GET'])
 def ask_question_with_stream_route():
     try:
-        data = request.get_json()
-        args = request.args.to_dict()
+        user_question = request.args.get("question")
+        user_id = request.args.get("user_id")
+        chat_id = request.args.get("chat_id")
 
-        if "question" not in data or "user_id" not in args:
-            return jsonify({"error": "'question' and 'user_id' fields are required"}), 400
-
-        user_question = data["question"]
-        user_id = args["user_id"]
-        chat_id = data.get("chat_id")
+        if not user_question or not user_id:
+            return Response("data: " + json.dumps({"error": "'question' and 'user_id' are required"}) + "\n\n", content_type="text/event-stream")
 
         chat = get_chat(chat_id) if chat_id else None
 
@@ -227,7 +224,6 @@ def ask_question_with_stream_route():
 
         chat_heading = chat["heading"]
         conversation_history = chat["messages"]
-
         conversation_history.append({"role": "user", "content": user_question})
 
         rag_context = retrieve_context(user_question)
@@ -235,39 +231,44 @@ def ask_question_with_stream_route():
         payload = {
             "model": "mistral",
             "messages": system_contexts + [{"role": "system", "content": "Context for the query: " + rag_context}] + conversation_history,
-            "stream": True  # Enable streaming
+            "stream": True
         }
 
         def generate():
-            response = requests.post(CHAT_API_URL, json=payload, stream=True)
-
-            if response.status_code != 200:
-                yield json.dumps({"error": "Failed to get response", "details": response.text}) + "\n"
-                return
-
             buffer = ""
-            for line in response.iter_lines():
-                if line:
-                    decoded_line = line.decode("utf-8").strip()
-                    # Ensure we only parse valid JSON
-                    if decoded_line.startswith("data: "):
-                        decoded_line = decoded_line[6:].strip()
-                    try:
-                        data = json.loads(decoded_line)
-                        if "choices" in data and data["choices"]:
-                            token = data["choices"][0]["delta"].get("content", "")
-                            buffer += token
-                            yield token
-                    except json.JSONDecodeError:
-                        continue
+            try:
+                with requests.post(CHAT_API_URL, json=payload, stream=True) as response:
+                    if response.status_code != 200:
+                        yield f"data: {json.dumps({'error': 'Failed to get response', 'details': response.text})}\n\n"
+                        return
 
-            conversation_history.append({"role": "assistant", "content": buffer})
-            store_chat(user_id, chat_id, chat["heading"], conversation_history)
+                    for line in response.iter_lines(decode_unicode=True):
+                        if line:
+                            decoded_line = line.strip()
+                            if decoded_line.startswith("data: "):
+                                decoded_line = decoded_line[6:].strip()
+
+                            try:
+                                data = json.loads(decoded_line)
+                                token = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
+
+                                if token.strip():
+                                    buffer += token
+                                    yield f"data: {json.dumps({'content': token})}\n\n"
+
+                            except json.JSONDecodeError:
+                                continue
+
+                conversation_history.append({"role": "assistant", "content": buffer})
+                store_chat(user_id, chat_id, chat["heading"], conversation_history)
+
+            except Exception as e:
+                yield f"data: {json.dumps({'error': 'Internal server error', 'details': str(e)})}\n\n"
 
         return Response(generate(), content_type="text/event-stream")
 
     except Exception as e:
-        return jsonify({"error": "Internal server error", "details": str(e)}), 500
+        return Response("data: " + json.dumps({"error": "Internal server error", "details": str(e)}) + "\n\n", content_type="text/event-stream")
 
 
 @app.route('/delete_chat/<chat_id>', methods=['DELETE'])
