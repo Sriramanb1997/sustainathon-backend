@@ -1,6 +1,19 @@
-# Run the application
+# BioSphere - BackEnd
+_A Gen AI Powered Centralized Platform for Wildlife, Biodiversity, and Conservation Projects Across India_
 
-## Setup
+*Python based backend application*
+
+
+## Execution Code
+
+#### Command to clone the code
+
+```
+https://github.com/Sriramanb1997/sustainathon-backend.git
+```
+## Run the application
+
+### Setup
 
 ```shell
     python -m venv sustainathon
@@ -8,10 +21,15 @@
     pip install -r requirements.txt
 ```
 
-## Run 
+### Run 
 
 ```shell
     python app.py
+```
+## Scrapping Command
+
+```
+extractURL_spider.py https://www.thegrasslandstrust.org/
 ```
 
 # API Endpoints
