@@ -11,9 +11,13 @@ import time
 from utils import retrieve_context
 from db import store_chat, get_chat, list_chats, delete_chat, store_user, get_user, delete_user, store_context, retrieve_context, get_user_chats, rename_chat, \
     list_users, store_contexts_from_file, delete_context_collection, get_context_collection_count, list_links, add_link, delete_link
+    
+FRONTEND_URL = "http://localhost:5173"  # Update this to your frontend URL if different
+CHAT_API_URL = "http://localhost:1234/v1/chat/completions"
+MAX_HISTORY = 5  # Configurable conversation history size
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "http://localhost:5173"}}, supports_credentials=True)
+CORS(app, resources={r"/*": {"origins": FRONTEND_URL}}, supports_credentials=True)
 
 app.secret_key = "strong_key"
 
@@ -32,9 +36,6 @@ google = oauth.register(
     server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',  # OpenID Connect metadata
     jwks_uri='https://www.googleapis.com/oauth2/v3/certs'  # Manually set the JWKS URI
 )
-
-CHAT_API_URL = "http://localhost:1234/v1/chat/completions"
-MAX_HISTORY = 5  # Configurable conversation history size
 
 # Default system contexts
 system_contexts = [
@@ -78,7 +79,7 @@ def authorize():
     store_user(user_id, user_data)
 
     # Redirect the user to frontend with user info or token
-    return redirect(f'http://localhost:5173/chat?user_id={user_id}')
+    return redirect(f'{FRONTEND_URL}/chat?user_id={user_id}')
 
 
 @app.route('/user/<user_id>', methods=['GET'])

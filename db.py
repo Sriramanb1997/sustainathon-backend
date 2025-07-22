@@ -1,10 +1,13 @@
-# In nilgiri, which ngos are taking care of elephants?
 import chromadb
 from sentence_transformers import SentenceTransformer
 import uuid
 from datetime import datetime
 import json
 import re
+import functools
+import hashlib
+import logging
+import spacy
 
 # Initialize ChromaDB client
 chroma_client = chromadb.PersistentClient(path="./chroma_db")
@@ -18,6 +21,7 @@ link_collection = chroma_client.get_or_create_collection(name="links")
 
 # Load Sentence Transformer model for embeddings
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
+nlp = spacy.load("en_core_web_sm")
 
 
 def store_chat(user_id, chat_id, heading, messages):
@@ -226,24 +230,43 @@ def get_user_chats(user_id):
     return list_chats(user_id)  # Simply reuse list_chats()
 
 
-def retrieve_context(query, top_k=5):
-    """Retrieve the most relevant context based on similarity search."""
+# Helper to hash queries for cache keys
+def _hash_query(query):
+    return hashlib.sha256(query.encode('utf-8')).hexdigest()
+
+# LRU cache for context retrieval (cache up to 128 unique queries)
+@functools.lru_cache(maxsize=128)
+def _cached_retrieve_context(query_hash, top_k):
+    # This function is only called with hashed queries to avoid issues with unhashable types
+    # The actual query string is not passed to the cache directly
+    # ...existing code for retrieve_context, but use the global embedder and context_collection...
     try:
+        # The query string is not available here, so we need to pass it as a global or refactor
+        # Instead, we will use a global variable to store the last query string
+        global _last_query_string
+        query = _last_query_string
         query_embedding = embedder.encode(query).tolist()
         results = context_collection.query(
             query_embeddings=[query_embedding],
             n_results=top_k,
             include=["metadatas"]
         )
-
         if not results or "metadatas" not in results or not results["metadatas"]:
             return ""
-
         return "\n\n".join([res.get("content", "") for res in results["metadatas"][0] if "content" in res])
-
     except Exception as e:
-        print(f"Error retrieving context for query '{query}': {str(e)}")
+        logging.error(f"Error retrieving context for query (cached): {str(e)}")
         return ""
+
+# Global variable to store the last query string for the cache
+_last_query_string = None
+
+def retrieve_context(query, top_k=5):
+    """Retrieve the most relevant context based on similarity search, with caching."""
+    global _last_query_string
+    _last_query_string = query
+    query_hash = _hash_query(query)
+    return _cached_retrieve_context(query_hash, top_k)
 
 
 def delete_context_collection():
@@ -264,6 +287,9 @@ def store_contexts_objects(text_item):
         sanctuary = text_item["sanctuary"]
         ngos = text_item["ngos"]
         content = text_item["content"]
+
+        # Clean the content before storing
+        content = clean_scraped_content(content)
 
         if content == "" or len(content) < 30:
             return
@@ -308,6 +334,9 @@ def store_contexts_from_file(file_path):
             ngos = context.get("ngos")
             content = context.get("content")
 
+            # Clean the content before storing
+            content = clean_scraped_content(content)
+
             if content == "" or len(content) < 30:
                 continue
 
@@ -333,3 +362,75 @@ def store_contexts_from_file(file_path):
         return "Invalid JSON format."
     except Exception as e:
         return str(e)
+
+# Patch: get context metadata for prompt building
+def get_structured_context(query, top_k=5):
+    """
+    Retrieve the most relevant context as a list of metadata dicts for structured prompt building.
+    Uses spaCy entity extraction to filter for context chunks that mention the same entities as the user question.
+    """
+    global _last_query_string
+    _last_query_string = query
+    try:
+        query_embedding = embedder.encode(query).tolist()
+        results = context_collection.query(
+            query_embeddings=[query_embedding],
+            n_results=top_k * 2,  # fetch more for filtering
+            include=["metadatas"]
+        )
+        if not results or "metadatas" not in results or not results["metadatas"]:
+            return []
+        metadatas = results["metadatas"][0]
+        # Entity filtering using spaCy
+        entities = extract_entities_from_question(query)
+        if entities:
+            filtered = []
+            for meta in metadatas:
+                content = meta.get("content", "").lower()
+                if any(entity in content for entity in entities):
+                    filtered.append(meta)
+            if filtered:
+                return filtered[:top_k]
+        # Fallback: return top_k if no entity match
+        return metadatas[:top_k]
+    except Exception as e:
+        logging.error(f"Error retrieving context for query (structured): {str(e)}")
+        return []
+
+# Cleaning function for scraped content
+def clean_scraped_content(text):
+    ignore_keywords = [
+        "home", "top of page", "contact", "about us", "privacy", "terms",
+        "login", "copyright", "menu", "site map", "newsletter", "subscribe",
+        "search", "disclaimer", "cookie", "policy", "advertise", "faq", "help",
+        "image", "photo", "logo", "icon", "banner", "picture", "figure", "caption", "graphic"
+    ]
+    # Regex patterns for common image/caption/alt text
+    image_caption_patterns = [
+        r"^image(\s*\d*)?:", r"^photo(\s*\d*)?:", r"^figure(\s*\d*)?:", r"^caption:",
+        r"^logo:", r"^icon:", r"^banner:", r"^picture:", r"^graphic:"
+    ]
+    lines = text.splitlines()
+    cleaned = []
+    for line in lines:
+        l = line.strip().lower()
+        if any(kw in l for kw in ignore_keywords):
+            continue
+        if any(re.match(pat, l) for pat in image_caption_patterns):
+            continue
+        if len(l.split()) < 5:
+            continue
+        cleaned.append(line)
+    return "\n".join(cleaned)
+
+def extract_entities_from_question(question):
+    """
+    Extracts named entities (ORG, GPE, LOC, FAC, PERSON) from the user question using spaCy.
+    Returns a list of unique entity strings.
+    """
+    doc = nlp(question)
+    entities = set()
+    for ent in doc.ents:
+        if ent.label_ in {"ORG", "GPE", "LOC", "FAC", "PERSON"}:
+            entities.add(ent.text.lower())
+    return list(entities)

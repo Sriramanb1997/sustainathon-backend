@@ -2,3 +2,5 @@
 chroma_db
 sustainathon
 __pycache__/
+.vscode
+.gitignore
