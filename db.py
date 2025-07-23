@@ -109,8 +109,13 @@ def list_chats(user_id, start_date=None, end_date=None, sort_order="desc", searc
 
         # Pagination
         total_chats = len(filtered_chats)
-        total_pages = max((total_chats + limit - 1) // limit, 1)
-        paginated_chats = filtered_chats[(page - 1) * limit: page * limit]
+        if limit is None:
+            # No pagination limit - return all chats
+            total_pages = 1
+            paginated_chats = filtered_chats
+        else:
+            total_pages = max((total_chats + limit - 1) // limit, 1)
+            paginated_chats = filtered_chats[(page - 1) * limit: page * limit]
 
         return {
             "total_chats": total_chats,
@@ -364,10 +369,45 @@ def store_contexts_from_file(file_path):
         return str(e)
 
 # Patch: get context metadata for prompt building
+def deduplicate_contexts(metadatas, similarity_threshold=0.3):
+    """
+    Simple deduplication: Keep only one entry per NGO to prevent repetitive information.
+    """
+    if not metadatas:
+        return []
+    
+    deduplicated = []
+    seen_ngos = set()
+    
+    for meta in metadatas:
+        ngos_json = meta.get("ngos", "[]")
+        
+        try:
+            ngos_list = json.loads(ngos_json) if isinstance(ngos_json, str) else ngos_json
+            if not isinstance(ngos_list, list):
+                ngos_list = [ngos_json] if ngos_json else []
+        except (json.JSONDecodeError, TypeError):
+            ngos_list = [ngos_json] if ngos_json else []
+        
+        # Check if any NGO in this context has already been seen
+        ngo_already_seen = any(ngo.lower().strip() in seen_ngos for ngo in ngos_list if ngo)
+        
+        if not ngo_already_seen:
+            deduplicated.append(meta)
+            # Mark all NGOs in this context as seen
+            for ngo in ngos_list:
+                if ngo:
+                    seen_ngos.add(ngo.lower().strip())
+    
+    return deduplicated
+
+
+
 def get_structured_context(query, top_k=5):
     """
     Retrieve the most relevant context as a list of metadata dicts for structured prompt building.
     Uses spaCy entity extraction to filter for context chunks that mention the same entities as the user question.
+    Includes deduplication logic to prevent repetitive information.
     """
     global _last_query_string
     _last_query_string = query
@@ -375,12 +415,13 @@ def get_structured_context(query, top_k=5):
         query_embedding = embedder.encode(query).tolist()
         results = context_collection.query(
             query_embeddings=[query_embedding],
-            n_results=top_k * 2,  # fetch more for filtering
+            n_results=top_k * 3,  # fetch more for filtering and deduplication
             include=["metadatas"]
         )
         if not results or "metadatas" not in results or not results["metadatas"]:
             return []
         metadatas = results["metadatas"][0]
+        
         # Entity filtering using spaCy
         entities = extract_entities_from_question(query)
         if entities:
@@ -389,10 +430,13 @@ def get_structured_context(query, top_k=5):
                 content = meta.get("content", "").lower()
                 if any(entity in content for entity in entities):
                     filtered.append(meta)
-            if filtered:
-                return filtered[:top_k]
-        # Fallback: return top_k if no entity match
-        return metadatas[:top_k]
+            metadatas = filtered if filtered else metadatas
+        
+        # Deduplication logic
+        deduplicated = deduplicate_contexts(metadatas)
+        
+        # Return top_k deduplicated results
+        return deduplicated[:top_k]
     except Exception as e:
         logging.error(f"Error retrieving context for query (structured): {str(e)}")
         return []
