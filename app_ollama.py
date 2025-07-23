@@ -14,23 +14,16 @@ from functools import wraps
 from utils import retrieve_context
 from db import store_chat, get_chat, list_chats, delete_chat, store_user, get_user, delete_user, store_context, retrieve_context, get_user_chats, rename_chat, \
     list_users, store_contexts_from_file, delete_context_collection, get_context_collection_count, list_links, add_link, delete_link, get_structured_context
+from model_providers import model_manager
     
-OLLAMA_API_URL = "http://127.0.0.1:11434/api/generate"
-OLLAMA_MODEL = "mistral:7b"
-
-# Ollama error handling configuration
-OLLAMA_MAX_RETRIES = int(os.getenv('OLLAMA_MAX_RETRIES', 3))
-OLLAMA_TIMEOUT = int(os.getenv('OLLAMA_TIMEOUT', 30))
-OLLAMA_RETRY_DELAY = int(os.getenv('OLLAMA_RETRY_DELAY', 2))
-OLLAMA_HEALTH_CHECK_TIMEOUT = int(os.getenv('OLLAMA_HEALTH_CHECK_TIMEOUT', 15))
-
+    
 # Simple cache and rate limiting to prevent excessive frontend polling
 ENDPOINT_CACHE = {}
-CACHE_DURATION = 5  # seconds
+CACHE_DURATION = int(os.getenv('CACHE_DURATION', 5))  # seconds
 LAST_REQUEST_TIME = {}
-MIN_REQUEST_INTERVAL = 1  # minimum seconds between requests for same endpoint
+MIN_REQUEST_INTERVAL = int(os.getenv('MIN_REQUEST_INTERVAL', 1))  # minimum seconds between requests for same endpoint
 
-FRONTEND_URL = "http://localhost:5173"  # Update this to your frontend URL if different
+FRONTEND_URL = os.getenv('FRONTEND_URL', "http://localhost:5173")  # Update this to your frontend URL if different
 LMSTUDIO_CHAT_API_URL = "http://localhost:1234/v1/chat/completions"
 MAX_HISTORY = 5  # Configurable conversation history size
 
@@ -160,15 +153,13 @@ Only cite sources that are present in the provided context and directly support 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
-def make_ollama_request(payload, stream=False, max_retries=OLLAMA_MAX_RETRIES, timeout=OLLAMA_TIMEOUT):
+def make_model_request(prompt, stream=False):
     """
-    Make a request to Ollama with proper error handling and retry logic.
+    Make a request to the configured model provider with proper error handling.
     
     Args:
-        payload: The JSON payload to send
+        prompt: The prompt to send to the model
         stream: Whether to use streaming response
-        max_retries: Maximum number of retries
-        timeout: Request timeout in seconds
     
     Returns:
         Response object or None if all retries failed
@@ -176,81 +167,41 @@ def make_ollama_request(payload, stream=False, max_retries=OLLAMA_MAX_RETRIES, t
     Raises:
         requests.exceptions.RequestException: If all retries are exhausted
     """
-    last_exception = None
-    
-    for attempt in range(max_retries + 1):
-        try:
-            logging.info(f"Attempting Ollama request (attempt {attempt + 1}/{max_retries + 1})")
-            
-            response = requests.post(
-                OLLAMA_API_URL, 
-                json=payload, 
-                stream=stream, 
-                timeout=timeout
-            )
-            
-            if response.status_code == 200:
-                logging.info(f"Ollama request successful on attempt {attempt + 1}")
-                return response
-            else:
-                logging.warning(f"Ollama request failed with status {response.status_code}: {response.text}")
-                if attempt < max_retries:
-                    time.sleep(OLLAMA_RETRY_DELAY)
-                    continue
-                else:
-                    raise requests.exceptions.RequestException(f"HTTP {response.status_code}: {response.text}")
-                    
-        except requests.exceptions.Timeout as e:
-            last_exception = e
-            logging.warning(f"Ollama request timeout on attempt {attempt + 1}: {e}")
-            if attempt < max_retries:
-                time.sleep(OLLAMA_RETRY_DELAY)
-                continue
-                
-        except requests.exceptions.ConnectionError as e:
-            last_exception = e
-            logging.warning(f"Ollama connection error on attempt {attempt + 1}: {e}")
-            if attempt < max_retries:
-                time.sleep(OLLAMA_RETRY_DELAY)
-                continue
-                
-        except requests.exceptions.RequestException as e:
-            last_exception = e
-            logging.error(f"Ollama request error on attempt {attempt + 1}: {e}")
-            if attempt < max_retries:
-                time.sleep(OLLAMA_RETRY_DELAY)
-                continue
-    
-    # All retries exhausted
-    error_msg = f"Ollama service unavailable after {max_retries + 1} attempts"
-    if last_exception:
-        error_msg += f": {last_exception}"
-    
-    logging.error(error_msg)
-    raise requests.exceptions.RequestException(error_msg)
+    try:
+        return model_manager.generate_response(prompt, stream=stream)
+    except Exception as e:
+        logging.error(f"Model request failed: {e}")
+        raise
 
-def check_ollama_health():
+def check_model_health():
     """
-    Check if Ollama service is available and responsive.
+    Check if the configured model provider is available and responsive.
     
     Returns:
-        bool: True if Ollama is available, False otherwise
+        bool: True if primary model is available, False otherwise
     """
     try:
-        # Use the lighter /api/version endpoint for health checks instead of generating text
-        version_url = "http://127.0.0.1:11434/api/version"
-        
-        response = requests.get(
-            version_url, 
-            timeout=OLLAMA_HEALTH_CHECK_TIMEOUT  # Use configurable timeout for health check
-        )
-        
-        return response.status_code == 200
-        
-    except requests.exceptions.RequestException:
+        health_status = model_manager.check_health()
+        # Check if primary provider is healthy
+        for provider_name, is_healthy in health_status.items():
+            if is_healthy:
+                return True
+        return False
+    except Exception as e:
+        logging.error(f"Health check failed: {e}")
         return False
 
-def get_ollama_fallback_response(question_type):
+def get_model_fallback_response(question_type):
+    """
+    Get a fallback response when the model is unavailable.
+    
+    Args:
+        question_type: The classified type of the question
+        
+    Returns:
+        str: Fallback response message
+    """
+    return model_manager.get_fallback_response(question_type)
     """
     Get a fallback response when Ollama is unavailable.
     
@@ -418,29 +369,28 @@ def filter_conversation_history_for_non_technical(conversation_history):
 
 def correct_typo_from_mistral(prompt):
     typo_prompt = f"Correct the typo in the prompt if any available. If there are no typo, you can return the same prompt: {prompt}"
-    payload = {
-        "model": OLLAMA_MODEL,
-        "prompt": typo_prompt
-    }
     
     try:
-        response = make_ollama_request(payload)
-        return response.json().get("response", "").strip()
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Failed to correct typo using Ollama: {e}")
+        response = make_model_request(typo_prompt)
+        if hasattr(response, 'json'):
+            return response.json().get("response", "").strip()
+        else:
+            # For OpenAI responses, the content is directly available
+            return response.strip()
+    except Exception as e:
+        logging.error(f"Failed to correct typo using model: {e}")
         return prompt  # Return original prompt if correction fails
 
 def generate_heading_from_mistral(prompt):
     heading_prompt = f"Generate a short title for this conversation: {prompt}"
-    payload = {
-        "model": OLLAMA_MODEL,
-        "prompt": heading_prompt,
-        "stream": False
-    }
     
     try:
-        response = make_ollama_request(payload)
-        heading = response.json().get("response", "").strip()
+        response = make_model_request(heading_prompt, stream=False)
+        if hasattr(response, 'json'):
+            heading = response.json().get("response", "").strip()
+        else:
+            # For OpenAI responses, the content is directly available
+            heading = response.strip()
         
         # Remove surrounding single or double quotes if present
         if (heading.startswith('"') and heading.endswith('"')) or (heading.startswith("'") and heading.endswith("'")):
@@ -469,8 +419,8 @@ def generate_heading_from_mistral(prompt):
             heading = heading[:57] + "..."
         
         return heading
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Failed to generate heading using Ollama: {e}")
+    except Exception as e:
+        logging.error(f"Failed to generate heading using model: {e}")
         return "General Conversation"  # Return default heading if generation fails
 
 # Question classification constants
@@ -511,21 +461,16 @@ def classify_question_with_ai(question):
     SECONDARY: [category1,category2] (only if mixed intent is yes)"""
     
     try:
-        payload = {
-            "model": OLLAMA_MODEL,
-            "prompt": classification_prompt,
-            "stream": False
-        }
-        
-        response = make_ollama_request(payload, timeout=10)  # Shorter timeout for classification
-        response_text = response.json().get("response", "").strip()
+        response = make_model_request(classification_prompt, stream=False)
+        if hasattr(response, 'json'):
+            response_text = response.json().get("response", "").strip()
+        else:
+            # For OpenAI responses, the content is directly available
+            response_text = response.strip()
         return parse_enhanced_classification(response_text)
         
-    except requests.exceptions.RequestException as e:
-        logging.warning(f"AI classification failed due to Ollama unavailability: {e}")
-        return create_default_classification()
     except Exception as e:
-        logging.warning(f"AI classification failed: {e}")
+        logging.warning(f"AI classification failed due to model unavailability: {e}")
         return create_default_classification()
 
 def parse_enhanced_classification(response_text):
@@ -939,18 +884,18 @@ def ask_question_with_stream_route():
         else:
             logging.info("No chat_id provided, will create new chat if needed")
 
-        # Check Ollama health before processing
-        if not check_ollama_health():
-            logging.warning("Ollama service is not available, returning fallback response")
+        # Check model health before processing
+        if not check_model_health():
+            logging.warning("Model service is not available, returning fallback response")
             
-            # Quick classification using simple pattern matching when Ollama is down
+            # Quick classification using simple pattern matching when model is down
             question_type = 'greeting' if is_obvious_greeting(user_question) else \
                            'gratitude' if is_obvious_gratitude(user_question) else \
                            'capability' if is_obvious_capability(user_question) else \
                            'wildlife_technical' if is_obvious_technical(user_question) else \
                            'general_environmental'
                            
-            fallback_response = get_ollama_fallback_response(question_type)
+            fallback_response = get_model_fallback_response(question_type)
             
             # Still maintain chat history even with fallback responses
             chat = get_chat(chat_id) if chat_id else None
@@ -1078,20 +1023,18 @@ def ask_question_with_stream_route():
 
         prompt = build_ollama_prompt(system_contexts, rag_context, conversation_history, classification_result)
 
-        payload = {
-            "model": OLLAMA_MODEL,
-            "prompt": prompt,
-            "stream": True
-        }
-
         def generate():
             buffer = ""
             try:
                 # Send chat_id at the start of the stream
                 yield f"data: {json.dumps({'chat_id': chat_id})}\n\n"
                 
-                # Use the error-handling wrapper for streaming requests
-                with make_ollama_request(payload, stream=True) as response:
+                # Use the unified model request method for streaming
+                response = make_model_request(prompt, stream=True)
+                
+                # Handle different response types (Ollama vs OpenAI streaming)
+                if hasattr(response, 'iter_lines'):
+                    # Ollama response - iterate over lines
                     for line in response.iter_lines(decode_unicode=True):
                         if line:
                             try:
@@ -1101,28 +1044,30 @@ def ask_question_with_stream_route():
                                 yield f"data: {json.dumps({'content': token})}\n\n"
                             except json.JSONDecodeError:
                                 continue
+                else:
+                    # OpenAI streaming response
+                    for chunk in response:
+                        if chunk.choices[0].delta.content is not None:
+                            token = chunk.choices[0].delta.content
+                            buffer += token
+                            yield f"data: {json.dumps({'content': token})}\n\n"
 
                 # Filter sources in the final answer using the context and question type
                 filtered_buffer = filter_sources(buffer, rag_context, question_type)
                 conversation_history.append({"role": "assistant", "content": filtered_buffer})
                 store_chat(user_id, chat_id, chat["heading"], conversation_history)
 
-                logging.info(f"Ollama streaming response for user_id: {user_id}, chat_id: {chat_id}, length: {len(filtered_buffer)}")
+                logging.info(f"Model streaming response for user_id: {user_id}, chat_id: {chat_id}, length: {len(filtered_buffer)}")
 
-            except requests.exceptions.RequestException as e:
-                error_msg = f"Ollama service is currently unavailable. Please check if Ollama is running and try again."
-                logging.error(f"Ollama request failed: {e}")
+            except Exception as e:
+                error_msg = f"Model service is currently unavailable. Please try again."
+                logging.error(f"Model request failed: {e}")
                 yield f"data: {json.dumps({'error': error_msg, 'details': str(e), 'chat_id': chat_id})}\n\n"
                 
                 # Store error message in conversation history for context
                 error_response = "I apologize, but I'm currently unable to process your request due to a service issue. Please try again in a moment."
                 conversation_history.append({"role": "assistant", "content": error_response})
                 store_chat(user_id, chat_id, chat["heading"], conversation_history)
-                
-            except Exception as e:
-                error_msg = "An unexpected error occurred while processing your request."
-                logging.error(f"Unexpected error in streaming response: {e}")
-                yield f"data: {json.dumps({'error': error_msg, 'details': str(e), 'chat_id': chat_id})}\n\n"
 
         return Response(generate(), content_type="text/event-stream")
 
@@ -1512,14 +1457,15 @@ def filter_sources(answer: str, context: str, question_type: str = None) -> str:
 def health_check():
     """Health check endpoint to verify service status"""
     try:
-        ollama_status = check_ollama_health()
+        health_status = model_manager.check_health()
+        primary_healthy = any(health_status.values()) if health_status else False
         
         return jsonify({
-            "status": "healthy" if ollama_status else "degraded",
-            "ollama_available": ollama_status,
+            "status": "healthy" if primary_healthy else "degraded",
+            "providers": health_status,
             "timestamp": datetime.utcnow().isoformat(),
-            "message": "Ollama service is available" if ollama_status else "Ollama service is unavailable - using fallback responses"
-        }), 200 if ollama_status else 503
+            "message": "Model services available" if primary_healthy else "Model services unavailable - using fallback responses"
+        }), 200 if primary_healthy else 503
         
     except Exception as e:
         logging.error(f"Health check failed: {e}")
@@ -1565,17 +1511,19 @@ def api_stats():
         "total_tracked_endpoints": len(LAST_REQUEST_TIME)
     })
 
-@app.route('/ollama/status', methods=['GET'])
-def ollama_status():
-    """Dedicated endpoint for Ollama service status"""
+@app.route('/model/status', methods=['GET'])
+def model_status():
+    """Dedicated endpoint for model service status"""
     try:
-        is_available = check_ollama_health()
+        health_status = model_manager.check_health()
+        primary_provider = model_manager.primary_provider
+        fallback_provider = model_manager.fallback_provider
+        
         return jsonify({
-            "ollama_available": is_available,
-            "ollama_url": OLLAMA_API_URL,
-            "ollama_model": OLLAMA_MODEL,
-            "max_retries": OLLAMA_MAX_RETRIES,
-            "timeout": OLLAMA_TIMEOUT,
+            "providers_health": health_status,
+            "primary_provider": type(primary_provider).__name__.replace('Provider', '').lower() if primary_provider else None,
+            "fallback_provider": type(fallback_provider).__name__.replace('Provider', '').lower() if fallback_provider else None,
+            "fallback_enabled": model_manager.fallback_provider is not None,
             "timestamp": datetime.utcnow().isoformat()
         })
     except Exception as e:
