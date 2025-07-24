@@ -13,7 +13,7 @@ from functools import wraps
 
 from utils import retrieve_context
 from db import store_chat, get_chat, list_chats, delete_chat, store_user, get_user, delete_user, store_context, retrieve_context, get_user_chats, rename_chat, \
-    list_users, store_contexts_from_file, delete_context_collection, get_context_collection_count, list_links, add_link, delete_link, get_structured_context
+    list_users, store_contexts_from_file, delete_context_collection, get_context_collection_count, list_links, add_link, delete_link, get_structured_context, check_sanctuary_exists
 from model_providers import model_manager
     
     
@@ -29,6 +29,12 @@ MAX_HISTORY = 5  # Configurable conversation history size
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": FRONTEND_URL}}, supports_credentials=True)
+
+# Configure Flask logging
+app.logger.setLevel(logging.INFO)
+# Disable Flask's default request logging to reduce noise
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.WARNING)
 
 app.secret_key = "strong_key"
 
@@ -113,6 +119,13 @@ Only answer questions related to wildlife, biodiversity, conservation, sanctuari
 - MIXED INTENT questions (gratitude/greeting + technical): Briefly acknowledge the thanks/greeting, then provide a comprehensive answer to the technical question using available context, formatted as bullet points with **bold headings for project names and key topics** or tables as appropriate.
 - OFF_TOPIC questions: Politely redirect the conversation back to wildlife, conservation, or environmental topics in India.
 
+[Information Availability Guidelines]
+- If asked about a specific wildlife sanctuary, national park, or conservation area that is NOT in your context database, clearly state that you don't have specific information about that particular location.
+- Do NOT provide information about different sanctuaries when asked about a specific one that you don't have data for.
+- If the specific location is not available, acknowledge this limitation and suggest that the user might want to contact relevant forest departments or conservation organizations for accurate information.
+- Only provide information about locations that are actually mentioned in your context when asked about specific places.
+- Avoid giving general information about similar places when asked about a specific location that you don't have data for.
+
 [NGO and Organization Information]
 - When mentioning NGOs or organizations, provide information concisely without repetition.
 - If multiple organizations are provided in the context, mention each one only once.
@@ -122,7 +135,7 @@ Only answer questions related to wildlife, biodiversity, conservation, sanctuari
 - If the same organization appears multiple times with different information, combine all relevant details into a single entry.
 
 [Source Attribution]
-Only cite sources that are present in the provided context and directly support your answer. If no relevant sources are available in the context, do not mention any sources or links.
+Do not include any source links or references in your response. Source attribution will be handled automatically.
 
 [Table Formatting]
 - **ALWAYS provide contextual explanation before presenting tables** - Start with a brief description or introduction that explains what the table contains.
@@ -151,7 +164,22 @@ Only cite sources that are present in the provided context and directly support 
 ]
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+import logging
+import sys
+
+# Configure logging with explicit settings
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s [%(filename)s:%(lineno)d] %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),  # Ensure logs go to stdout
+    ],
+    force=True  # Override any existing logging configuration
+)
+
+# Create a logger for this module
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 def make_model_request(prompt, stream=False):
     """
@@ -869,14 +897,21 @@ def build_retrieval_query(conversation_history, user_question, max_turns=MAX_HIS
 @app.route('/ask_with_stream', methods=['GET'])
 def ask_question_with_stream_route():
     try:
+        # Immediate debug output
+        print("🚀 DEBUG: Route /ask_with_stream was reached!")
+        logging.info("🚀 Route /ask_with_stream was reached!")
+        
         user_question = request.args.get("question")
         user_id = request.args.get("user_id")
         chat_id = request.args.get("chat_id")
 
+        print(f"🔍 DEBUG: Received parameters - user_id: {user_id}, chat_id: {chat_id}, question: {user_question}")
+        
         if not user_question or not user_id:
             return Response("data: " + json.dumps({"error": "'question' and 'user_id' are required"}) + "\n\n", content_type="text/event-stream")
 
         logging.info(f"Streaming question from user_id: {user_id}, chat_id: {chat_id}, question: {user_question}")
+        print(f"📝 PRINT: Streaming question from user_id: {user_id}, chat_id: {chat_id}, question: {user_question}")
         
         # Add detailed logging for chat_id handling
         if chat_id:
@@ -980,46 +1015,234 @@ def ask_question_with_stream_route():
         conversation_history = chat["messages"]
         conversation_history.append({"role": "user", "content": user_question})
 
+        print("🔥 DEBUG: About to start question classification...")
+        print(f"🔥 DEBUG: Question to classify: '{user_question}'")
+        
         # Enhanced intelligent question classification with mixed intent detection
         classification_result = intelligent_question_classifier(user_question, conversation_history[:-1])
         question_type = classification_result['type'] if isinstance(classification_result, dict) else classification_result
         
+        print(f"🎯 DEBUG: Classification completed - Type: {question_type}")
+        print(f"🎯 DEBUG: Full result: {classification_result}")
+        
         # Log enhanced classification details
-        if isinstance(classification_result, dict):
-            logging.info(f"Question classified as: {question_type} (confidence: {classification_result['confidence']}%, mixed: {classification_result['is_mixed']}) for question: {user_question}")
-            if classification_result.get('context_hint'):
-                logging.info(f"Classification method: {classification_result['context_hint']}")
-        else:
-            logging.info(f"Question classified as: {question_type} for question: {user_question}")
+        try:
+            logging.info("=" * 60)
+            logging.info(f"📝 QUESTION CLASSIFICATION RESULTS")
+            print("=" * 60)
+            print(f"📝 QUESTION CLASSIFICATION RESULTS")
+            logging.info(f"   Question: '{user_question}'")
+            print(f"   Question: '{user_question}'")
+            if isinstance(classification_result, dict):
+                logging.info(f"   ✅ Primary Category: {question_type.upper()}")
+                logging.info(f"   🎯 Confidence Score: {classification_result['confidence']}%")
+                logging.info(f"   🔄 Mixed Intent: {'YES' if classification_result['is_mixed'] else 'NO'}")
+                print(f"   ✅ Primary Category: {question_type.upper()}")
+                print(f"   🎯 Confidence Score: {classification_result['confidence']}%")
+                print(f"   🔄 Mixed Intent: {'YES' if classification_result['is_mixed'] else 'NO'}")
+                if classification_result.get('is_mixed') and classification_result.get('secondary_types'):
+                    logging.info(f"   📋 Secondary Categories: {', '.join(classification_result['secondary_types'])}")
+                    print(f"   📋 Secondary Categories: {', '.join(classification_result['secondary_types'])}")
+                if classification_result.get('context_hint'):
+                    logging.info(f"   🔍 Classification Method: {classification_result['context_hint']}")
+                    print(f"   🔍 Classification Method: {classification_result['context_hint']}")
+            else:
+                logging.info(f"   ✅ Category: {question_type.upper()}")
+                print(f"   ✅ Category: {question_type.upper()}")
+            logging.info("=" * 60)
+            print("=" * 60)
+        except Exception as e:
+            print(f"❌ ERROR in classification logging: {e}")
+            logging.error(f"❌ ERROR in classification logging: {e}")
         
         if should_use_context(classification_result):
             # For technical questions, build retrieval query normally
             retrieval_query = build_retrieval_query(conversation_history[:-1], user_question, max_turns=MAX_HISTORY)
+            logging.info(f"🔍 Building retrieval query for context search...")
+            logging.info(f"   Query built from conversation history: {len(conversation_history[:-1])} previous messages")
+            
+            # Check if the question is asking about a specific sanctuary vs. general information
+            # First, check for general query patterns that should use all available context
+            general_query_patterns = [
+                r'\b(?:where are all|list all|all the|how many|what are all)\b.*?(?:tiger reserve|national park|wildlife sanctuary|sanctuary|reserve)',
+                r'\b(?:tell me about all|show me all|give me a list)\b.*?(?:tiger reserve|national park|wildlife sanctuary|sanctuary|reserve)',
+                r'\b(?:tiger reserves? in india|national parks in india|sanctuaries in india)\b'
+            ]
+            
+            is_general_query = any(re.search(pattern, user_question.lower()) for pattern in general_query_patterns)
+            
+            if is_general_query:
+                logging.info(f"🌍 General query detected - will use all available context")
+                sanctuary_matches = []  # Don't treat as specific sanctuary query
+            else:
+                # Check if the question is asking about a specific sanctuary
+                # Improved pattern to avoid matching articles and common words, and require proper sanctuary names
+                sanctuary_pattern = r'\b(?!(?:the|all|any|where|what|which|how|many)\b)([A-Za-z][A-Za-z\s]{2,}?)\s+(?:wls|wildlife sanctuary|national park|tiger reserve|biosphere reserve|sanctuary|park|reserve)\b'
+                sanctuary_matches = re.findall(sanctuary_pattern, user_question.lower())
+                # Filter out obvious non-sanctuary matches
+                sanctuary_matches = [match.strip() for match in sanctuary_matches if match.strip().lower() not in ['the', 'all', 'any', 'where', 'what', 'which', 'how', 'many', 'are', 'is']]
+            
+            # More specific state pattern - only match after prepositions that indicate location
+            state_pattern = r'\b(?:in|from|of|at)\s+([a-zA-Z]+(?:\s+[a-zA-Z]+)*?)(?:\s*[,.]|\s*$)'
+            state_matches = re.findall(state_pattern, user_question.lower())
+            # Filter out common non-state words
+            state_matches = [state.strip() for state in state_matches if state.strip().lower() not in ['about', 'the', 'a', 'an', 'this', 'that']]
+            
+            if sanctuary_matches:
+                logging.info(f"🏞️  Sanctuary-specific query detected: {sanctuary_matches}")
+                if state_matches:
+                    logging.info(f"🗺️  State mentioned: {state_matches}")
+            elif is_general_query:
+                logging.info(f"🌍 General information query - will provide comprehensive context")
+            
             context_metadatas = get_structured_context(retrieval_query)
             
-            # Log context details for debugging
-            logging.info(f"Retrieved {len(context_metadatas)} context blocks for {question_type} question")
+            # Enhanced context retrieval logging
+            logging.info("-" * 50)
+            logging.info(f"📊 CONTEXT RETRIEVAL RESULTS")
+            logging.info(f"   Retrieved Documents: {len(context_metadatas)}")
+            
             if context_metadatas:
-                orgs_found = []
-                for ctx in context_metadatas:
+                # Extract and analyze organizations
+                all_orgs = set()
+                all_sanctuaries = set()
+                all_urls = set()
+                content_lengths = []
+                
+                for i, ctx in enumerate(context_metadatas, 1):
+                    # Parse NGOs
                     ngos_data = ctx.get('ngos', '[]')
                     try:
                         ngos_list = json.loads(ngos_data) if isinstance(ngos_data, str) else ngos_data
                         if isinstance(ngos_list, list):
-                            orgs_found.extend([ngo for ngo in ngos_list if ngo])
+                            orgs = [ngo.strip() for ngo in ngos_list if ngo and ngo.strip()]
+                            all_orgs.update(orgs)
                         elif ngos_data:
-                            orgs_found.append(ngos_data)
+                            all_orgs.add(str(ngos_data).strip())
                     except (json.JSONDecodeError, TypeError):
                         if ngos_data:
-                            orgs_found.append(ngos_data)
-                logging.info(f"Organizations in context: {', '.join(set(orgs_found))}")
+                            all_orgs.add(str(ngos_data).strip())
+                    
+                    # Parse sanctuaries
+                    sanctuary_data = ctx.get('sanctuary', '[]')
+                    try:
+                        sanctuary_list = json.loads(sanctuary_data) if isinstance(sanctuary_data, str) else sanctuary_data
+                        if isinstance(sanctuary_list, list):
+                            sanctuaries = [s.strip() for s in sanctuary_list if s and s.strip()]
+                            all_sanctuaries.update(sanctuaries)
+                        elif sanctuary_data:
+                            all_sanctuaries.add(str(sanctuary_data).strip())
+                    except (json.JSONDecodeError, TypeError):
+                        if sanctuary_data:
+                            all_sanctuaries.add(str(sanctuary_data).strip())
+                    
+                    # Collect URLs and content lengths
+                    if ctx.get('url'):
+                        all_urls.add(ctx['url'])
+                    
+                    content_length = len(ctx.get('content', ''))
+                    content_lengths.append(content_length)
+                    
+                    # Log individual context details (first 3 for brevity)
+                    if i <= 3:
+                        logging.info(f"   📄 Context {i}:")
+                        if ctx.get('url'):
+                            logging.info(f"      🔗 URL: {ctx['url']}")
+                        if orgs:
+                            logging.info(f"      🏢 Organization(s): {', '.join(orgs)}")
+                        if sanctuaries:
+                            logging.info(f"      🌲 Sanctuary(ies): {', '.join(sanctuaries)}")
+                        logging.info(f"      📝 Content length: {content_length} chars")
+                
+                # Summary statistics
+                logging.info(f"   📈 SUMMARY:")
+                logging.info(f"      🏢 Unique Organizations: {len(all_orgs)} ({', '.join(sorted(all_orgs))})")
+                logging.info(f"      🌲 Unique Sanctuaries: {len(all_sanctuaries)} ({', '.join(sorted(all_sanctuaries))})")
+                logging.info(f"      🔗 Unique Sources: {len(all_urls)}")
+                if content_lengths:
+                    avg_length = sum(content_lengths) / len(content_lengths)
+                    logging.info(f"      📊 Content: avg {avg_length:.0f} chars, range {min(content_lengths)}-{max(content_lengths)}")
+            else:
+                logging.info(f"   ❌ No relevant context found")
+            logging.info("-" * 50)
             
-            rag_context = build_structured_context(context_metadatas)
-            logging.info(f"Final context length after deduplication: {len(rag_context)}")
+            # If asking about a specific sanctuary, validate if the retrieved context actually contains that sanctuary
+            if sanctuary_matches:
+                sanctuary_name = sanctuary_matches[0]
+                state_name = state_matches[0] if state_matches else None
+                
+                # Check if the retrieved context actually contains the requested sanctuary
+                found_requested_sanctuary = False
+                if context_metadatas:
+                    for ctx in context_metadatas:
+                        sanctuary_data = ctx.get('sanctuary', '[]')
+                        try:
+                            sanctuary_list = json.loads(sanctuary_data) if isinstance(sanctuary_data, str) else sanctuary_data
+                            if isinstance(sanctuary_list, list):
+                                # Check if any sanctuary in the list matches the requested one (case-insensitive)
+                                for sanctuary in sanctuary_list:
+                                    if sanctuary and sanctuary_name.lower() in sanctuary.lower():
+                                        found_requested_sanctuary = True
+                                        break
+                            elif sanctuary_data and sanctuary_name.lower() in str(sanctuary_data).lower():
+                                found_requested_sanctuary = True
+                        except (json.JSONDecodeError, TypeError):
+                            if sanctuary_data and sanctuary_name.lower() in str(sanctuary_data).lower():
+                                found_requested_sanctuary = True
+                        
+                        if found_requested_sanctuary:
+                            break
+                
+                if not found_requested_sanctuary:
+                    # The retrieved context doesn't contain the requested sanctuary
+                    logging.info(f"🔍 Retrieved context doesn't contain requested sanctuary '{sanctuary_name}'")
+                    logging.info(f"🔍 Checking if sanctuary '{sanctuary_name}' exists in database...")
+                    
+                    if not check_sanctuary_exists(sanctuary_name, state_name):
+                        logging.info(f"❌ Sanctuary '{sanctuary_name}' not found in database")
+                        # Set context to indicate the sanctuary is not in our database
+                        rag_context = f"The sanctuary '{sanctuary_name}' mentioned is not currently in our conservation database. Our database primarily contains information about other wildlife sanctuaries and conservation projects."
+                        context_sources = []
+                    else:
+                        logging.info(f"✅ Sanctuary '{sanctuary_name}' exists but specific context not retrieved")
+                        # Sanctuary exists but specific context wasn't retrieved - provide general response
+                        rag_context = f"While '{sanctuary_name}' exists in our database, detailed information about this specific sanctuary is not currently available in our context. Our database contains information about other wildlife sanctuaries and conservation projects."
+                        context_sources = []
+                else:
+                    logging.info(f"✅ Found requested sanctuary '{sanctuary_name}' in retrieved context")
+                    # Extract sources from context for proper attribution
+                    context_sources = extract_sources_from_context(context_metadatas)
+                    rag_context = build_structured_context(context_metadatas)
+            else:
+                # No specific sanctuary mentioned - use all retrieved context
+                context_sources = extract_sources_from_context(context_metadatas)
+                rag_context = build_structured_context(context_metadatas)
+            
+            final_context_length = len(rag_context) if isinstance(rag_context, str) else 0
+            logging.info(f"📋 Final structured context: {final_context_length} characters")
+            if context_sources:
+                logging.info(f"📚 Sources for attribution: {len(context_sources)} URLs")
+                for i, source in enumerate(context_sources, 1):
+                    logging.info(f"   {i}. {source}")
         else:
             # For greetings/capability questions, don't retrieve any context
             rag_context = ""
-            logging.info(f"Skipped context retrieval for {question_type} question")
+            context_sources = []
+            logging.info("-" * 50)
+            logging.info(f"🚫 CONTEXT RETRIEVAL SKIPPED")
+            logging.info(f"   Reason: Question type '{question_type}' doesn't require context")
+            logging.info(f"   Categories that skip context: greetings, gratitude, capability, off-topic")
+            logging.info("-" * 50)
+
+        # Final processing summary
+        logging.info("🎯 PROCESSING SUMMARY")
+        logging.info(f"   User: {user_id} | Chat: {chat_id}")
+        logging.info(f"   Question Type: {question_type.upper()}")
+        logging.info(f"   Context Used: {'YES' if rag_context else 'NO'}")
+        if rag_context:
+            logging.info(f"   Context Length: {len(rag_context)} chars from {len(context_sources) if context_sources else 0} sources")
+        logging.info(f"   Conversation Length: {len(conversation_history)} messages")
+        logging.info("=" * 60)
 
         prompt = build_ollama_prompt(system_contexts, rag_context, conversation_history, classification_result)
 
@@ -1052,8 +1275,22 @@ def ask_question_with_stream_route():
                             buffer += token
                             yield f"data: {json.dumps({'content': token})}\n\n"
 
-                # Filter sources in the final answer using the context and question type
-                filtered_buffer = filter_sources(buffer, rag_context, question_type)
+                # Filter and clean the AI response (removes any hallucinated sources)
+                filtered_buffer = filter_sources(buffer, rag_context, question_type, context_sources)
+                
+                # Stream sources separately for technical questions
+                if question_type not in [QUESTION_TYPES['GREETING'], QUESTION_TYPES['GRATITUDE'], 
+                                       QUESTION_TYPES['CAPABILITY'], QUESTION_TYPES['OFF_TOPIC']] and context_sources:
+                    # Add sources section to streaming output
+                    sources_header = '\n\n### Sources\n'
+                    yield f"data: {json.dumps({'content': sources_header})}\n\n"
+                    for source in context_sources:
+                        source_line = f'- {source}\n'
+                        yield f"data: {json.dumps({'content': source_line})}\n\n"
+                    
+                    # Also add to the buffer for storage
+                    filtered_buffer = manually_append_sources(filtered_buffer, context_sources, question_type)
+                
                 conversation_history.append({"role": "assistant", "content": filtered_buffer})
                 store_chat(user_id, chat_id, chat["heading"], conversation_history)
 
@@ -1303,9 +1540,297 @@ def get_context_collection_count_route():
     count = get_context_collection_count()
     return jsonify({"count": count})
 
+@app.route('/debug_context_collection', methods=['GET'])
+def debug_context_collection_route():
+    """Debug the context collection state and show structure."""
+    try:
+        from db import context_collection
+        count = get_context_collection_count()
+        
+        # Get query parameters for pagination and detail level
+        limit = int(request.args.get('limit', 5))
+        offset = int(request.args.get('offset', 0))
+        show_full_content = request.args.get('show_content', 'false').lower() == 'true'
+        
+        # Try to get a sample of items with metadata
+        sample_items = context_collection.get(
+            limit=limit,
+            offset=offset,
+            include=["metadatas", "documents"]
+        )
+        
+        # Process the sample items to show structure
+        structured_items = []
+        if sample_items and sample_items.get('ids'):
+            for i, item_id in enumerate(sample_items['ids']):
+                metadata = sample_items.get('metadatas', [{}])[i] if i < len(sample_items.get('metadatas', [])) else {}
+                document = sample_items.get('documents', [''])[i] if i < len(sample_items.get('documents', [])) else ''
+                
+                # Parse JSON fields if they exist
+                try:
+                    ngos = json.loads(metadata.get('ngos', '[]')) if metadata.get('ngos') else []
+                except:
+                    ngos = metadata.get('ngos', [])
+                
+                try:
+                    sanctuary = json.loads(metadata.get('sanctuary', '[]')) if metadata.get('sanctuary') else []
+                except:
+                    sanctuary = metadata.get('sanctuary', [])
+                
+                item_structure = {
+                    "id": item_id,
+                    "url": metadata.get('url', 'N/A'),
+                    "ngos": ngos,
+                    "sanctuaries": sanctuary,
+                    "content_length": len(metadata.get('content', '')),
+                    "document_length": len(document) if document else 0
+                }
+                
+                # Add full content if requested (truncated for readability)
+                if show_full_content:
+                    content = metadata.get('content', '')
+                    item_structure['content_preview'] = content[:500] + "..." if len(content) > 500 else content
+                
+                structured_items.append(item_structure)
+        
+        # Get unique organizations and sanctuaries for overview
+        all_orgs = set()
+        all_sanctuaries = set()
+        
+        if sample_items and sample_items.get('metadatas'):
+            for metadata in sample_items['metadatas']:
+                try:
+                    ngos = json.loads(metadata.get('ngos', '[]'))
+                    if isinstance(ngos, list):
+                        all_orgs.update([ngo for ngo in ngos if ngo])
+                except:
+                    pass
+                
+                try:
+                    sanctuaries = json.loads(metadata.get('sanctuary', '[]'))
+                    if isinstance(sanctuaries, list):
+                        all_sanctuaries.update([s for s in sanctuaries if s])
+                except:
+                    pass
+        
+        return jsonify({
+            "collection_info": {
+                "total_count": count,
+                "collection_exists": context_collection is not None,
+                "collection_name": "context_embeddings"
+            },
+            "query_params": {
+                "limit": limit,
+                "offset": offset,
+                "show_full_content": show_full_content
+            },
+            "sample_overview": {
+                "items_returned": len(structured_items),
+                "unique_organizations": list(all_orgs),
+                "unique_sanctuaries": list(all_sanctuaries),
+                "organization_count": len(all_orgs),
+                "sanctuary_count": len(all_sanctuaries)
+            },
+            "sample_items": structured_items,
+            "usage_note": "Use ?limit=N&offset=N for pagination, ?show_content=true to see content previews"
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)})
 
 
+@app.route('/context_structure', methods=['GET'])
+def get_context_structure():
+    """Get detailed structure and statistics of the context database."""
+    try:
+        from db import context_collection
+        
+        # Get query parameters
+        limit = int(request.args.get('limit', 10))
+        search_org = request.args.get('search_org', '')
+        search_sanctuary = request.args.get('search_sanctuary', '')
+        
+        total_count = get_context_collection_count()
+        
+        # Get all items for analysis (or limited sample for large databases)
+        analysis_limit = min(total_count, 100)  # Analyze first 100 items for stats
+        all_items = context_collection.get(
+            limit=analysis_limit,
+            include=["metadatas"]
+        )
+        
+        # Analyze the structure
+        all_orgs = set()
+        all_sanctuaries = set()
+        all_urls = set()
+        content_lengths = []
+        url_domains = {}
+        
+        if all_items and all_items.get('metadatas'):
+            for metadata in all_items['metadatas']:
+                # Extract organizations
+                try:
+                    ngos = json.loads(metadata.get('ngos', '[]'))
+                    if isinstance(ngos, list):
+                        all_orgs.update([ngo.strip() for ngo in ngos if ngo and ngo.strip()])
+                except:
+                    pass
+                
+                # Extract sanctuaries
+                try:
+                    sanctuaries = json.loads(metadata.get('sanctuary', '[]'))
+                    if isinstance(sanctuaries, list):
+                        all_sanctuaries.update([s.strip() for s in sanctuaries if s and s.strip()])
+                except:
+                    pass
+                
+                # Extract URLs and domains
+                url = metadata.get('url', '')
+                if url:
+                    all_urls.add(url)
+                    try:
+                        from urllib.parse import urlparse
+                        domain = urlparse(url).netloc
+                        url_domains[domain] = url_domains.get(domain, 0) + 1
+                    except:
+                        pass
+                
+                # Content length analysis
+                content = metadata.get('content', '')
+                content_lengths.append(len(content))
+        
+        # Filter items based on search criteria
+        filtered_items = []
+        if all_items and all_items.get('ids'):
+            for i, item_id in enumerate(all_items['ids'][:limit]):
+                metadata = all_items.get('metadatas', [{}])[i] if i < len(all_items.get('metadatas', [])) else {}
+                
+                # Apply filters
+                if search_org:
+                    ngos_str = metadata.get('ngos', '[]')
+                    if search_org.lower() not in ngos_str.lower():
+                        continue
+                
+                if search_sanctuary:
+                    sanctuary_str = metadata.get('sanctuary', '[]')
+                    if search_sanctuary.lower() not in sanctuary_str.lower():
+                        continue
+                
+                # Parse and format the item
+                try:
+                    ngos = json.loads(metadata.get('ngos', '[]'))
+                except:
+                    ngos = [metadata.get('ngos', '')] if metadata.get('ngos') else []
+                
+                try:
+                    sanctuaries = json.loads(metadata.get('sanctuary', '[]'))
+                except:
+                    sanctuaries = [metadata.get('sanctuary', '')] if metadata.get('sanctuary') else []
+                
+                filtered_items.append({
+                    "id": item_id,
+                    "url": metadata.get('url', 'N/A'),
+                    "organizations": [org for org in ngos if org],
+                    "sanctuaries": [s for s in sanctuaries if s],
+                    "content_length": len(metadata.get('content', '')),
+                    "content_preview": metadata.get('content', '')[:200] + "..." if len(metadata.get('content', '')) > 200 else metadata.get('content', '')
+                })
+        
+        # Calculate statistics
+        avg_content_length = sum(content_lengths) / len(content_lengths) if content_lengths else 0
+        
+        return jsonify({
+            "database_overview": {
+                "total_items": total_count,
+                "analyzed_items": analysis_limit,
+                "analysis_complete": analysis_limit >= total_count
+            },
+            "statistics": {
+                "total_organizations": len(all_orgs),
+                "total_sanctuaries": len(all_sanctuaries),
+                "total_unique_urls": len(all_urls),
+                "avg_content_length": round(avg_content_length, 2),
+                "min_content_length": min(content_lengths) if content_lengths else 0,
+                "max_content_length": max(content_lengths) if content_lengths else 0
+            },
+            "organizations": sorted(list(all_orgs)),
+            "sanctuaries": sorted(list(all_sanctuaries)),
+            "url_domains": dict(sorted(url_domains.items(), key=lambda x: x[1], reverse=True)),
+            "filtered_items": filtered_items,
+            "query_info": {
+                "limit": limit,
+                "search_org": search_org,
+                "search_sanctuary": search_sanctuary,
+                "results_count": len(filtered_items)
+            },
+            "usage": {
+                "endpoints": {
+                    "/context_structure": "Get overview and filtered view of contexts",
+                    "/debug_context_collection": "Get raw debug info with pagination"
+                },
+                "parameters": {
+                    "limit": "Number of items to return (default: 10)",
+                    "search_org": "Filter by organization name (partial match)",
+                    "search_sanctuary": "Filter by sanctuary name (partial match)"
+                }
+            }
+        })
+        
+    except Exception as e:
+        return jsonify({"error": f"Failed to analyze context structure: {str(e)}"})
 
+
+def extract_sources_from_context(context_metadatas):
+    """
+    Extract unique source URLs from context metadata.
+    Returns a list of unique URLs that can be used for source attribution.
+    """
+    if not context_metadatas:
+        return []
+    
+    sources = []
+    seen_urls = set()
+    
+    for ctx in context_metadatas:
+        url = ctx.get('url', '').strip()
+        if url and url not in seen_urls:
+            sources.append(url)
+            seen_urls.add(url)
+    
+    return sources
+
+def manually_append_sources(answer: str, context_sources: list, question_type: str = None) -> str:
+    """
+    Manually append sources from context to the answer.
+    This ensures we only include actual sources from the retrieved context,
+    not hallucinated sources from the AI.
+    """
+    # Don't add sources for greeting, gratitude, capability, or off-topic questions
+    if question_type in [QUESTION_TYPES['GREETING'], QUESTION_TYPES['GRATITUDE'], 
+                        QUESTION_TYPES['CAPABILITY'], QUESTION_TYPES['OFF_TOPIC']]:
+        return answer
+    
+    # Don't add sources if no context sources are available
+    if not context_sources:
+        return answer
+    
+    # Remove any existing sources that might have been hallucinated by AI
+    answer = re.sub(r'\n\s*#+\s*Sources?:?\s*.*$', '', answer, flags=re.IGNORECASE | re.MULTILINE | re.DOTALL)
+    answer = re.sub(r'\n\s*Sources?:\s*.*$', '', answer, flags=re.IGNORECASE | re.MULTILINE | re.DOTALL)
+    answer = re.sub(r'https?://[^\s,;\)\]\}]+', '', answer)  # Remove any URLs from the answer
+    
+    # Clean up the answer
+    answer = answer.rstrip()
+    
+    # Add our manual sources section
+    if context_sources:
+        if answer and not answer.endswith('\n'):
+            answer += '\n\n'
+        
+        answer += "### Sources\n"
+        for source in context_sources:
+            answer += f"- {source}\n"
+    
+    return answer
 
 def build_structured_context(context_metadatas):
     """
@@ -1391,13 +1916,11 @@ def build_structured_context(context_metadatas):
     
     return '\n\n---\n\n'.join(context_blocks)
 
-def filter_sources(answer: str, context: str, question_type: str = None) -> str:
+def filter_sources(answer: str, context: str, question_type: str = None, context_sources: list = None) -> str:
     """
-    Removes any sources/links from the answer that are not present in the context.
-    If no valid sources remain, removes the sources section entirely.
-    Handles URLs with trailing punctuation and both http/https links.
-    Also removes any context structure that might have been echoed by the AI.
-    Enhanced with question type awareness for better filtering and repetition removal.
+    Clean up the AI response by removing any hallucinated sources or unwanted content.
+    This function focuses on cleaning rather than adding sources, since we handle
+    source addition manually via manually_append_sources().
     """
     # Remove any context structure patterns that might be echoed
     answer = re.sub(r'Context \d+:.*?\|.*?\n', '', answer, flags=re.MULTILINE)
@@ -1420,9 +1943,11 @@ def filter_sources(answer: str, context: str, question_type: str = None) -> str:
         # For off-topic questions, keep the response minimal and remove technical details
         answer = re.sub(r'Organization: [^.]*\n', '', answer, flags=re.MULTILINE)
         answer = re.sub(r'Sanctuary: [^.]*\n', '', answer, flags=re.MULTILINE)
+        # Remove any sources for off-topic questions
+        answer = re.sub(r'Sources?:.*?(\n|$)', '', answer, flags=re.IGNORECASE)
     
     else:
-        # For technical questions, apply normal source filtering
+        # For technical questions, remove any hallucinated sources but keep the content
         # Remove specific organizational content that shouldn't appear in capability responses
         if re.search(r'\b(what\s+(can|do)\s+you\s+do|capabilities|functions|help)\b', answer, re.IGNORECASE):
             answer = re.sub(r'The organization "[^"]*" working at [^.]*\. They [^.]*\.', '', answer, flags=re.DOTALL)
@@ -1430,21 +1955,11 @@ def filter_sources(answer: str, context: str, question_type: str = None) -> str:
             answer = re.sub(r'Sanctuary: [^.]*\n', '', answer, flags=re.MULTILINE)
             answer = re.sub(r'[^.]*\b(Kalpavriksh|Bhimashankar|Wildlife Sanctuary|Maharashtra)\b[^.]*\.', '', answer, flags=re.IGNORECASE)
     
-        # Find all URLs in the answer (http or https, ignore trailing punctuation)
-        urls_in_answer = re.findall(r'https?://[^\s,;\)\]\}]+', answer)
-        # Normalize URLs by stripping trailing punctuation
-        def clean_url(url):
-            return url.rstrip('.,;:!?)]}')
-        cleaned_urls_in_answer = [clean_url(url) for url in urls_in_answer]
-        valid_urls = [url for url in cleaned_urls_in_answer if url in context]
-        # If there are valid URLs, keep only those in the answer
-        if valid_urls:
-            for orig_url, clean_url_val in zip(urls_in_answer, cleaned_urls_in_answer):
-                if clean_url_val not in valid_urls:
-                    answer = answer.replace(orig_url, '')
-        else:
-            # Remove any 'Sources:' or similar sections if no valid URLs
-            answer = re.sub(r'Sources?:.*?(\n|$)', '', answer, flags=re.IGNORECASE)
+        # Remove any AI-generated sources section (we'll add our own manually)
+        answer = re.sub(r'\n\s*Sources?:\s*.*$', '', answer, flags=re.IGNORECASE | re.MULTILINE | re.DOTALL)
+        
+        # Remove any URLs that might be hallucinated by the AI
+        answer = re.sub(r'https?://[^\s,;\)\]\}]+', '', answer)
     
     # Clean up extra whitespace and empty lines
     answer = re.sub(r'\n\s*\n\s*\n', '\n\n', answer)  # Multiple empty lines to double
@@ -1533,4 +2048,8 @@ def model_status():
         }), 500
 
 if __name__ == '__main__':
+    # Test logging immediately
+    print("🧪 STARTUP: Testing logging configuration...")
+    logging.info("🧪 STARTUP: Logging is working correctly!")
+    print("🧪 STARTUP: Starting Flask application...")
     app.run(host="localhost", debug=True, port=5000)

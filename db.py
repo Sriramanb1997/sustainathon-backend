@@ -8,9 +8,11 @@ import functools
 import hashlib
 import logging
 import spacy
+import os
 
-# Initialize ChromaDB client
-chroma_client = chromadb.PersistentClient(path="./chroma_db")
+# Initialize ChromaDB client with absolute path
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chroma_db")
+chroma_client = chromadb.PersistentClient(path=DB_PATH)
 
 # Create collections
 chats_collection = chroma_client.get_or_create_collection(name="chats")
@@ -215,12 +217,22 @@ def delete_link(link_id):
 
 def store_context(link, text):
     """Store context embeddings."""
-    embedding = embedder.encode(text).tolist()
-    context_collection.add(
-        ids=[str(uuid.uuid4())],
-        metadatas=[{"link": link, "text": text}],
-        embeddings=[embedding]
-    )
+    try:
+        global context_collection
+        # Ensure we have a valid collection reference
+        if context_collection is None:
+            context_collection = chroma_client.get_or_create_collection(name="context_embeddings")
+        
+        embedding = embedder.encode(text).tolist()
+        context_collection.add(
+            ids=[str(uuid.uuid4())],
+            metadatas=[{"link": link, "text": text}],
+            embeddings=[embedding]
+        )
+        logging.info(f"Successfully stored context for link: {link}")
+    except Exception as e:
+        logging.error(f"Error storing context for link {link}: {str(e)}")
+        raise
 
 
 def rename_chat(chat_id, new_heading):
@@ -281,12 +293,25 @@ def delete_context_collection():
 
 
 def get_context_collection_count():
-    return context_collection.count()
+    """Get the count of documents in the context collection."""
+    try:
+        global context_collection
+        # Ensure we have a valid collection reference
+        if context_collection is None:
+            context_collection = chroma_client.get_or_create_collection(name="context_embeddings")
+        return context_collection.count()
+    except Exception as e:
+        logging.error(f"Error getting context collection count: {str(e)}")
+        return 0
 
 
 def store_contexts_objects(text_item):
     """Read a JSON file and store contexts with embeddings in ChromaDB."""
     try:
+        global context_collection
+        # Ensure we have a valid collection reference
+        if context_collection is None:
+            context_collection = chroma_client.get_or_create_collection(name="context_embeddings")
 
         url = text_item["url"]
         sanctuary = text_item["sanctuary"]
@@ -294,16 +319,35 @@ def store_contexts_objects(text_item):
         content = text_item["content"]
 
         # Clean the content before storing
+        original_length = len(content)
         content = clean_scraped_content(content)
+        cleaned_length = len(content)
+        
+        # Try lenient cleaning if strict cleaning removes too much
+        if cleaned_length < 30 and original_length > 100:
+            print(f"Trying lenient cleaning for {url}...")
+            content = clean_scraped_content_lenient(text_item['content'])
+            cleaned_length = len(content)
+            print(f"  After lenient cleaning: {cleaned_length}")
+        
+        print(f"Content processing for {url}:")
+        print(f"  Original length: {original_length}")
+        print(f"  After cleaning: {cleaned_length}")
+        print(f"  First 100 chars of original: {text_item['content'][:100]}...")
+        print(f"  First 100 chars after cleaning: {content[:100]}...")
 
         if content == "" or len(content) < 30:
-            return
+            logging.warning(f"Skipping content for URL {url} - content too short or empty (length: {len(content)})")
+            print(f"REJECTED: Content too short for {url} (length: {len(content)})")
+            return False
 
         combined_content = f" Name of the NGO: {' '.join(ngos)}. URL to the Content which NGO maintains: '{url}'. Sanctuaries which the NGO are maintaining: {' '.join(sanctuary)}. Content of the full page: {content}"
 
         embedding = embedder.encode(combined_content).tolist()
+        doc_id = str(uuid.uuid4())
+        
         context_collection.add(
-            ids=[str(uuid.uuid4())],
+            ids=[doc_id],
             metadatas=[{
                 "url": url,
                 "sanctuary": json.dumps(sanctuary),
@@ -312,18 +356,28 @@ def store_contexts_objects(text_item):
             }],
             embeddings=[embedding]
         )
+        
+        current_count = context_collection.count()
+        logging.info(f"Successfully stored context object for URL: {url} with ID: {doc_id}")
+        print(f"Stored context for {url}. Collection count: {current_count}")
+        return True
 
-    except FileNotFoundError:
-        return "File not found."
-    except json.JSONDecodeError:
-        return "Invalid JSON format."
+    except KeyError as e:
+        logging.error(f"Missing required key in text_item: {str(e)}")
+        return False
     except Exception as e:
-        return str(e)
+        logging.error(f"Error storing context object: {str(e)}")
+        return False
 
 
 def store_contexts_from_file(file_path):
     """Read a JSON file and store contexts with embeddings in ChromaDB."""
     try:
+        global context_collection
+        # Ensure we have a valid collection reference
+        if context_collection is None:
+            context_collection = chroma_client.get_or_create_collection(name="context_embeddings")
+        
         # Open and read the JSON file
         with open(file_path, 'r') as file:
             contexts = json.load(file)
@@ -332,6 +386,7 @@ def store_contexts_from_file(file_path):
         if not isinstance(contexts, list):
             raise ValueError("Invalid data format. Expected an array of objects.")
 
+        stored_count = 0
         # Store each context
         for context in contexts:
             url = context.get("url")
@@ -343,6 +398,7 @@ def store_contexts_from_file(file_path):
             content = clean_scraped_content(content)
 
             if content == "" or len(content) < 30:
+                logging.warning(f"Skipping content for URL {url} - content too short or empty")
                 continue
 
             combined_content = f" Name of the NGO: {' '.join(ngos)}. URL to the Content which NGO maintains: '{url}'. Sanctuaries which the NGO are maintaining: {' '.join(sanctuary)}. Content of the full page: {content}"
@@ -358,14 +414,19 @@ def store_contexts_from_file(file_path):
                 }],
                 embeddings=[embedding]
             )
+            stored_count += 1
 
+        logging.info(f"Successfully stored {stored_count} contexts from file: {file_path}")
         return "Contexts stored successfully."
 
     except FileNotFoundError:
+        logging.error(f"File not found: {file_path}")
         return "File not found."
     except json.JSONDecodeError:
+        logging.error(f"Invalid JSON format in file: {file_path}")
         return "Invalid JSON format."
     except Exception as e:
+        logging.error(f"Error storing contexts from file {file_path}: {str(e)}")
         return str(e)
 
 # Patch: get context metadata for prompt building
@@ -406,7 +467,7 @@ def deduplicate_contexts(metadatas, similarity_threshold=0.3):
 def get_structured_context(query, top_k=5):
     """
     Retrieve the most relevant context as a list of metadata dicts for structured prompt building.
-    Uses spaCy entity extraction to filter for context chunks that mention the same entities as the user question.
+    Uses improved entity extraction and specific matching to filter for truly relevant context chunks.
     Includes deduplication logic to prevent repetitive information.
     """
     global _last_query_string
@@ -415,22 +476,59 @@ def get_structured_context(query, top_k=5):
         query_embedding = embedder.encode(query).tolist()
         results = context_collection.query(
             query_embeddings=[query_embedding],
-            n_results=top_k * 3,  # fetch more for filtering and deduplication
+            n_results=min(100, top_k * 20),  # fetch many more for better sanctuary matching
             include=["metadatas"]
         )
         if not results or "metadatas" not in results or not results["metadatas"]:
             return []
         metadatas = results["metadatas"][0]
         
-        # Entity filtering using spaCy
+        # Improved entity filtering using spaCy with better specificity
         entities = extract_entities_from_question(query)
         if entities:
             filtered = []
+            query_lower = query.lower()
+            
+            # Check for specific sanctuary/location names in the query
+            specific_sanctuary_pattern = r'(\w+)(?:\s+(?:wls|wildlife\s+sanctuary|national\s+park|tiger\s+reserve|biosphere|sanctuary|park|reserve))'
+            specific_matches = re.findall(specific_sanctuary_pattern, query_lower, re.IGNORECASE)
+            
             for meta in metadatas:
                 content = meta.get("content", "").lower()
-                if any(entity in content for entity in entities):
-                    filtered.append(meta)
-            metadatas = filtered if filtered else metadatas
+                sanctuary_field = meta.get("sanctuary", "").lower()
+                
+                # If query mentions a specific sanctuary, check if it matches exactly
+                if specific_matches:
+                    sanctuary_match = False
+                    for specific_match in specific_matches:
+                        # Check sanctuary field first (higher priority)
+                        if specific_match.lower().strip() in sanctuary_field:
+                            sanctuary_match = True
+                            break
+                        # Then check content
+                        elif specific_match.lower().strip() in content:
+                            sanctuary_match = True
+                            break
+                    
+                    if sanctuary_match:
+                        # Additional check: if query has a specific sanctuary name, 
+                        # ensure the main entity (sanctuary name) is present
+                        main_entities = [e for e in entities if len(e) > 3 and e not in ['wls', 'sanctuary', 'national', 'park']]
+                        if main_entities:
+                            entity_match = any(entity in content or entity in sanctuary_field for entity in main_entities)
+                            if entity_match:
+                                filtered.append(meta)
+                        else:
+                            filtered.append(meta)
+                else:
+                    # For general queries, use the original logic but with stricter matching
+                    # Require at least 2 entities to match OR one very specific entity
+                    matching_entities = [entity for entity in entities if entity in content]
+                    if len(matching_entities) >= 2 or any(len(entity) > 5 for entity in matching_entities):
+                        filtered.append(meta)
+            
+            # If no specific matches found, fall back to semantic similarity only
+            metadatas = filtered if filtered else metadatas[:top_k]
         
         # Deduplication logic
         deduplicated = deduplicate_contexts(metadatas)
@@ -440,6 +538,54 @@ def get_structured_context(query, top_k=5):
     except Exception as e:
         logging.error(f"Error retrieving context for query (structured): {str(e)}")
         return []
+
+def check_sanctuary_exists(sanctuary_name, state_name=None):
+    """
+    Check if a specific sanctuary exists in the database.
+    Returns True if found, False otherwise.
+    """
+    try:
+        # Skip obviously invalid sanctuary names
+        if len(sanctuary_name.strip()) < 3 or sanctuary_name.lower().strip() in ['the', 'all', 'any', 'where', 'what', 'which', 'how', 'many', 'are', 'is']:
+            return False
+            
+        # Search for the exact sanctuary name in the sanctuary field
+        search_query = sanctuary_name.lower()
+        if state_name:
+            search_query += f" {state_name.lower()}"
+            
+        query_embedding = embedder.encode(search_query).tolist()
+        results = context_collection.query(
+            query_embeddings=[query_embedding],
+            n_results=10,
+            include=["metadatas"]
+        )
+        
+        if not results or "metadatas" not in results or not results["metadatas"]:
+            return False
+            
+        for meta in results["metadatas"][0]:
+            sanctuary_field = meta.get("sanctuary", "").lower()
+            content = meta.get("content", "").lower()
+            
+            # More precise matching - require the sanctuary name to be a significant part, not just a substring
+            sanctuary_name_lower = sanctuary_name.lower().strip()
+            
+            # Check for exact or close match in sanctuary field (must be substantial match)
+            if sanctuary_name_lower in sanctuary_field:
+                # Ensure it's not just a common word match - the sanctuary name should be substantial
+                if len(sanctuary_name_lower) >= 4 and (not state_name or state_name.lower() in sanctuary_field):
+                    return True
+                    
+            # Check for exact mention in content (only if it looks like a proper sanctuary name)
+            if len(sanctuary_name_lower) >= 4 and sanctuary_name_lower in content:
+                if not state_name or state_name.lower() in content:
+                    return True
+                    
+        return False
+    except Exception as e:
+        logging.error(f"Error checking sanctuary existence: {str(e)}")
+        return False
 
 # Cleaning function for scraped content
 def clean_scraped_content(text):
@@ -463,6 +609,19 @@ def clean_scraped_content(text):
         if any(re.match(pat, l) for pat in image_caption_patterns):
             continue
         if len(l.split()) < 5:
+            continue
+        cleaned.append(line)
+    return "\n".join(cleaned)
+
+# Less aggressive cleaning function for debugging
+def clean_scraped_content_lenient(text):
+    """Less aggressive content cleaning for debugging purposes."""
+    lines = text.splitlines()
+    cleaned = []
+    for line in lines:
+        l = line.strip()
+        # Only remove very short lines (less than 3 words) and empty lines
+        if len(l.split()) < 3 or l == "":
             continue
         cleaned.append(line)
     return "\n".join(cleaned)

@@ -1,3 +1,5 @@
+import os
+import sys
 import scrapy
 from scrapy.crawler import CrawlerProcess
 import logging
@@ -7,13 +9,15 @@ from urllib.parse import urlparse, urljoin
 import argparse
 import json
 
-from db import store_contexts_objects
+# Add parent directory to Python path to import db module
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from db import store_contexts_objects, get_context_collection_count
 
 
 class ExtractUrls(scrapy.Spider):
     name = "extract"
 
-    def __init__(self, urls, exclude_strings, state, sanctuary, ngos, *args, **kwargs):
+    def __init__(self, urls, exclude_strings, state, sanctuary, ngos,  output_dir="output", *args, **kwargs):
         super(ExtractUrls, self).__init__(*args, **kwargs)
         self.urls = urls
         self.exclude_strings = exclude_strings
@@ -21,6 +25,9 @@ class ExtractUrls(scrapy.Spider):
         self.sanctuary = sanctuary
         self.ngos = ngos
         self.results = {}
+        self.output_dir = output_dir
+        os.makedirs(self.output_dir, exist_ok=True)  # Create the output folder if it doesn't exist
+
 
     def start_requests(self):
         #urls = ['https://www.bnhs.org/listing/conservation-research', ]
@@ -50,6 +57,9 @@ class ExtractUrls(scrapy.Spider):
             all_text = re.sub(r'[^\w\s]', '', all_text)
             all_text = re.sub(r'\s+', ' ', all_text).strip()
 
+            # Debug: Log content length before processing
+            print(f"Raw content length for {response.url}: {len(all_text)} characters")
+            print(f"First 200 chars: {all_text[:200]}...")
 
             text_item = {
                 'url': response.url,
@@ -62,7 +72,19 @@ class ExtractUrls(scrapy.Spider):
             if domain not in self.results:
                 self.results[domain] = []
             self.results[domain].append(text_item)
-            store_contexts_objects(text_item)
+            
+            # Debug: Check count before storing
+            count_before = get_context_collection_count()
+            print(f"Count before storing {response.url}: {count_before}")
+            
+            # Store the context
+            success = store_contexts_objects(text_item)
+            print(f"Storage success for {response.url}: {success}")
+            
+            # Debug: Check count after storing
+            count_after = get_context_collection_count()
+            print(f"Count after storing {response.url}: {count_after}")
+            
             yield text_item
 
             base_url = response.url
@@ -78,7 +100,7 @@ class ExtractUrls(scrapy.Spider):
 
     # def closed(self, reason):
     #     for domain, items in self.results.items():
-    #         filename = f"{domain}.json"
+    #         filename = os.path.join(self.output_dir, f"{domain}.json")
     #         with open(filename, 'w') as f:
     #             json.dump(items, f, indent=4)
 
@@ -101,6 +123,7 @@ if __name__ == "__main__":
         "FEEDS": {
             "output.json": {"format": "json"},
         },
+        "TELNETCONSOLE_ENABLED": False,  # Disable telnet console to avoid shutdown errors
     })
     process.crawl(ExtractUrls, urls=url_list, exclude_strings=exclude_list, state=state_list, sanctuary=sanctuary_list,
                   ngos=ngo_list)

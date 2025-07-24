@@ -191,6 +191,50 @@
 				}
 			},
 			"response": []
+		},
+		{
+			"name": "Get Context Collection Count",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{local-flask-server}}/get_context_collection_count",
+					"host": [
+						"{{local-flask-server}}"
+					],
+					"path": [
+						"get_context_collection_count"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Debug Context Collection",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{local-flask-server}}/debug_context_collection?limit=5&offset=0",
+					"host": [
+						"{{local-flask-server}}"
+					],
+					"path": [
+						"debug_context_collection"
+					],
+					"query": [
+						{
+							"key": "limit",
+							"value": "5"
+						},
+						{
+							"key": "offset",
+							"value": "0"
+						}
+					]
+				}
+			},
+			"response": []
 		}
 	],
 	"variable": [

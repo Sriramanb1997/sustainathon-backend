@@ -1,0 +1,8 @@
+### Get Context Collection Count
+GET http://127.0.0.1:5000/get_context_collection_count
+
+### Debug Context Collection
+GET http://127.0.0.1:5000/debug_context_collection?limit=5&offset=0
+
+### Test server health
+GET http://127.0.0.1:5000/
