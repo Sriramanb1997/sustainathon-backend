@@ -9,6 +9,8 @@ import json
 import time
 import logging
 import re
+import sys
+import threading
 from functools import wraps
 
 from utils import retrieve_context
@@ -26,6 +28,28 @@ MIN_REQUEST_INTERVAL = int(os.getenv('MIN_REQUEST_INTERVAL', 1))  # minimum seco
 FRONTEND_URL = os.getenv('FRONTEND_URL', "http://localhost:5173")  # Update this to your frontend URL if different
 LMSTUDIO_CHAT_API_URL = "http://localhost:1234/v1/chat/completions"
 MAX_HISTORY = 5  # Configurable conversation history size
+
+# Efficiency Configuration
+USE_COMBINED_AI_CALLS = os.getenv('USE_COMBINED_AI_CALLS', 'true').lower() == 'true'  # Enable combined heading+classification calls for new chats
+COMBINED_AI_TIMEOUT = int(os.getenv('COMBINED_AI_TIMEOUT', 7))  # Timeout in seconds for combined calls before fallback
+FORCE_SEPARATE_CALLS = os.getenv('FORCE_SEPARATE_CALLS', 'false').lower() == 'true'  # Emergency override to always use separate calls
+
+# Adaptive timeout tracking
+COMBINED_CALL_STATS = {
+    'total_attempts': 0,
+    'timeouts': 0,
+    'successes': 0,
+    'avg_response_time': 0
+}
+
+# Combined AI Calls Implementation:
+# When USE_COMBINED_AI_CALLS=true (default), new conversations use a single AI request 
+# to generate both heading and classification, reducing API calls by ~50% for new chats.
+# If the combined call takes longer than COMBINED_AI_TIMEOUT seconds, it falls back to separate calls.
+# The system adapts: if >50% of combined calls timeout, it temporarily disables the feature.
+# Set FORCE_SEPARATE_CALLS=true for immediate fallback to traditional separate calls.
+# Existing conversations still use traditional separate classification for reliability.
+# Set USE_COMBINED_AI_CALLS=false to disable this optimization.
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": FRONTEND_URL}}, supports_credentials=True)
@@ -144,6 +168,35 @@ Do not include any source links or references in your response. Source attributi
 - Use tables for any comparative or list-based information to improve readability, but always precede tables with descriptive text.
 - Tables should have clear headers and be well-organized.
 - Structure your response as: [Brief explanation/context] + [Table with data] + [Additional details if relevant].
+
+[CRITICAL: Proper Markdown Table Format]
+**ALWAYS use proper Markdown table formatting with pipes (|) and header separators:**
+
+**Adaptive Table Headers:**
+Choose column headers that best represent the available data. Common examples:
+
+For Wildlife Organizations:
+| Organization Name | Location | Conservation Focus | Key Activities |
+
+For Sanctuaries/Parks:
+| Sanctuary Name | State/Region | Species Protected | Area (sq km) |
+
+For Research Organizations:
+| Organization | Research Focus | Publications/Projects | Collaborations |
+
+For General NGOs:
+| Organization Name | Location/Area | Focus Area | Activities |
+
+**NEVER use this INCORRECT format:**
+| Organization Name | Location/Sanctuary | Focus Area | Activities |---|---|---| 
+
+**Key Rules:**
+1. Each column must be separated by pipes (|)
+2. Header row must be followed by a separator row with dashes (|---|---|---|)
+3. Each data row must be on its own line
+4. All content must be properly aligned within the table structure
+5. Adapt column headers to match the specific information available
+6. Use the most appropriate table structure for the data being presented
 
 [Bullet Point Formatting]
 - **Use bullet points for most technical answers** that cannot be formatted as tables, to improve readability and organization.
@@ -293,20 +346,37 @@ def get_user_details_route(user_id):
 
 def build_ollama_prompt(system_contexts, rag_context, conversation_history, classification_result=None):
     # Concatenate system instructions, RAG context, and chat history into a single prompt string
+    print(f"🎯 DEBUG: Starting build_ollama_prompt...")
+    logging.info("🎯 DEBUG: Starting build_ollama_prompt...")
+    
     prompt_parts = []
+    print(f"🎯 DEBUG: Adding system contexts, count: {len(system_contexts)}")
+    logging.info(f"🎯 DEBUG: Adding system contexts, count: {len(system_contexts)}")
+    
     for ctx in system_contexts:
         prompt_parts.append(ctx["content"])
     
     # Extract question type and mixed intent info
+    print(f"🎯 DEBUG: Processing classification_result: {classification_result}")
+    logging.info(f"🎯 DEBUG: Processing classification_result: {classification_result}")
+    
     if isinstance(classification_result, dict):
-        question_type = classification_result['type']
+        # Handle both 'type' and 'primary_type' keys for compatibility
+        question_type = classification_result.get('type') or classification_result.get('primary_type', QUESTION_TYPES['GENERAL_ENVIRONMENTAL'])
         is_mixed = classification_result.get('is_mixed', False)
         secondary_types = classification_result.get('secondary_types', [])
+        print(f"🎯 DEBUG: Extracted question_type: {question_type}, is_mixed: {is_mixed}")
+        logging.info(f"🎯 DEBUG: Extracted question_type: {question_type}, is_mixed: {is_mixed}")
     else:
         # Backward compatibility
         question_type = classification_result
         is_mixed = False
         secondary_types = []
+        print(f"🎯 DEBUG: Backward compatibility, question_type: {question_type}")
+        logging.info(f"🎯 DEBUG: Backward compatibility, question_type: {question_type}")
+    
+    print(f"🎯 DEBUG: About to check context inclusion for question_type: {question_type}")
+    logging.info(f"🎯 DEBUG: About to check context inclusion for question_type: {question_type}")
     
     # Include context based on question type
     if rag_context.strip() and question_type not in [QUESTION_TYPES['GREETING'], QUESTION_TYPES['GRATITUDE'], QUESTION_TYPES['CAPABILITY']]:
@@ -319,13 +389,13 @@ def build_ollama_prompt(system_contexts, rag_context, conversation_history, clas
         
         prompt_parts.append(rag_context)
         
-        # Add specific formatting instructions based on question content
+        # Add dynamic formatting instructions based on question content
         user_question = ""
         if conversation_history:
             user_question = conversation_history[-1].get("content", "").lower()
         
         if any(keyword in user_question for keyword in ["ngo", "organization", "organizations", "ngos", "foundation", "foundations"]):
-            prompt_parts.append("IMPORTANT: Format your response about organizations/NGOs as a clear table with columns like 'Organization Name', 'Location/Sanctuary', 'Focus Area', 'Activities'. Do NOT use bullet points or paragraph lists for organizational information.")
+            prompt_parts.append("IMPORTANT: For organizational information, choose the most appropriate format based on the data available:\n\n- If you have structured data for multiple organizations (3+ organizations with similar data fields), use a well-formatted Markdown table with appropriate column headers\n- If you have limited information or only 1-2 organizations, use bullet points with **bold organization names**\n- Adapt table headers to match the available data (e.g., 'Organization Name | Location | Focus Area | Key Activities' or 'Sanctuary Name | State | Species Protected | Area')\n- Always provide context before tables or lists to explain what information is being presented")
         else:
             prompt_parts.append("IMPORTANT: When using bullet points, format project names, species names, and key topics in **bold** (e.g., **Tiger Conservation Project**: Description of the project). This makes the content easier to scan and read.")
         
@@ -409,61 +479,233 @@ def correct_typo_from_mistral(prompt):
         logging.error(f"Failed to correct typo using model: {e}")
         return prompt  # Return original prompt if correction fails
 
-def generate_heading_from_mistral(prompt):
-    heading_prompt = f"Generate a short title for this conversation: {prompt}"
+def should_use_combined_calls():
+    """Adaptive decision whether to use combined calls based on recent performance"""
+    # Emergency override
+    if FORCE_SEPARATE_CALLS:
+        return False
+        
+    if not USE_COMBINED_AI_CALLS:
+        return False
+    
+    # If we have enough data and timeout rate is too high, disable temporarily
+    if COMBINED_CALL_STATS['total_attempts'] >= 5:
+        timeout_rate = COMBINED_CALL_STATS['timeouts'] / COMBINED_CALL_STATS['total_attempts']
+        if timeout_rate > 0.5:  # More than 50% timeouts
+            logging.warning(f"🚨 Combined calls disabled temporarily due to high timeout rate: {timeout_rate:.1%}")
+            return False
+    
+    return True
+
+def update_combined_call_stats(success, response_time):
+    """Update statistics for adaptive combined call decision making"""
+    COMBINED_CALL_STATS['total_attempts'] += 1
+    
+    if success:
+        COMBINED_CALL_STATS['successes'] += 1
+        # Update average response time
+        old_avg = COMBINED_CALL_STATS['avg_response_time']
+        count = COMBINED_CALL_STATS['successes']
+        COMBINED_CALL_STATS['avg_response_time'] = (old_avg * (count - 1) + response_time) / count
+    else:
+        COMBINED_CALL_STATS['timeouts'] += 1
+    
+    # Reset stats periodically to allow for model performance changes
+    if COMBINED_CALL_STATS['total_attempts'] >= 20:
+        COMBINED_CALL_STATS['total_attempts'] = 10  # Keep some history
+        COMBINED_CALL_STATS['timeouts'] = min(COMBINED_CALL_STATS['timeouts'], 5)
+        COMBINED_CALL_STATS['successes'] = max(COMBINED_CALL_STATS['successes'], 5)
+
+def generate_heading_and_classify_combined_fast(prompt):
+    """Fast combined AI call with thread-based timeout and immediate fallback"""
+    import threading
+    import time
+    
+    # Shared variables for thread communication
+    result = {'response': None, 'error': None, 'completed': False}
+    
+    def make_request():
+        try:
+            combined_prompt = f"""
+            Analyze this question and provide BOTH a conversational heading and classification in this EXACT format:
+            HEADING: [generate a short, friendly conversation title - NOT the classification type]
+            PRIMARY: [WILDLIFE_TECHNICAL|CONSERVATION_TECHNICAL|GREETING|GRATITUDE|CAPABILITY|GENERAL_ENVIRONMENTAL|OFF_TOPIC]
+            CONFIDENCE: [0-100]
+            MIXED_INTENT: [yes/no]
+            
+            For HEADING examples:
+            - "Hello" -> "Welcome Chat"
+            - "Thanks for the help" -> "Gratitude and Thanks"  
+            - "Tell me about tigers" -> "Tiger Information"
+            - "What can you do?" -> "Assistant Capabilities"
+            
+            Question: "{prompt}"
+            """
+            
+            response = make_model_request(combined_prompt, stream=False)
+            
+            if hasattr(response, 'json'):
+                response_text = response.json().get('response', '')
+            else:
+                response_text = str(response)
+            
+            result['response'] = response_text
+            result['completed'] = True
+            
+        except Exception as e:
+            result['error'] = str(e)
+            result['completed'] = True
+    
+    # Start the request in a separate thread
+    start_time = time.time()
+    logging.info(f"🚀 Starting combined AI call with {COMBINED_AI_TIMEOUT}s timeout...")
+    
+    thread = threading.Thread(target=make_request)
+    thread.daemon = True  # Thread will die with main program
+    thread.start()
+    
+    # Wait for completion or timeout
+    thread.join(timeout=COMBINED_AI_TIMEOUT)
+    elapsed_time = time.time() - start_time
+    
+    if result['completed'] and result['response'] is not None:
+        logging.info(f"✅ Combined AI call succeeded in {elapsed_time:.2f}s")
+        update_combined_call_stats(True, elapsed_time)
+        return parse_combined_response(result['response'], prompt)
+    elif result['completed'] and result['error']:
+        logging.warning(f"❌ Combined AI call failed after {elapsed_time:.2f}s: {result['error']}, using fallback")
+        update_combined_call_stats(False, elapsed_time)
+    else:
+        logging.warning(f"⏰ Combined AI call timed out after {COMBINED_AI_TIMEOUT}s, using immediate fallback")
+        update_combined_call_stats(False, elapsed_time)
+    
+    # Fast fallback to separate calls
+    logging.info("🔄 Falling back to separate heading and classification calls...")
+    heading = generate_heading_from_mistral_fallback(prompt)
+    classification = classify_question_with_ai_fallback(prompt)
+    return heading, classification
+
+def parse_combined_response(response_text, original_prompt):
+    """Parse the combined response for heading and classification"""
+    classification_map = {
+        'GREETING': QUESTION_TYPES['GREETING'],
+        'GRATITUDE': QUESTION_TYPES['GRATITUDE'], 
+        'CAPABILITY': QUESTION_TYPES['CAPABILITY'],
+        'WILDLIFE_TECHNICAL': QUESTION_TYPES['WILDLIFE_TECHNICAL'],
+        'CONSERVATION_TECHNICAL': QUESTION_TYPES['CONSERVATION_TECHNICAL'],
+        'GENERAL_ENVIRONMENTAL': QUESTION_TYPES['GENERAL_ENVIRONMENTAL'],
+        'OFF_TOPIC': QUESTION_TYPES['OFF_TOPIC']
+    }
+    
+    try:
+        lines = response_text.split('\n')  # Keep original case for parsing
+        heading = "General Conversation"
+        classification_result = create_default_classification()
+        
+        for line in lines:
+            line = line.strip()
+            line_upper = line.upper()  # Only convert to uppercase for comparison
+            
+            if line_upper.startswith('HEADING:'):
+                # Extract heading preserving original case
+                heading = line[8:].strip()  # Remove 'HEADING:' (8 characters)
+                heading = clean_heading(heading)
+            elif line_upper.startswith('PRIMARY:'):
+                primary = line_upper.replace('PRIMARY:', '').strip()
+                classification_result['primary_type'] = classification_map.get(primary, QUESTION_TYPES['GENERAL_ENVIRONMENTAL'])
+            elif line_upper.startswith('CONFIDENCE:'):
+                try:
+                    confidence = int(line_upper.replace('CONFIDENCE:', '').strip())
+                    classification_result['confidence'] = max(0, min(100, confidence))
+                except ValueError:
+                    pass
+            elif line_upper.startswith('MIXED_INTENT:'):
+                mixed = line_upper.replace('MIXED_INTENT:', '').strip()
+                classification_result['is_mixed'] = mixed == 'YES'
+            elif line_upper.startswith('SECONDARY:'):
+                if classification_result['is_mixed']:
+                    secondary = line_upper.replace('SECONDARY:', '').strip()
+                    if secondary and secondary != '[]':
+                        secondary_types = [classification_map.get(cat.strip(), QUESTION_TYPES['GENERAL_ENVIRONMENTAL']) 
+                                         for cat in secondary.split(',') if cat.strip()]
+                        classification_result['secondary_types'] = secondary_types
+        
+        return heading, classification_result
+        
+    except Exception as e:
+        logging.warning(f"Failed to parse combined response: {e}")
+        heading = clean_heading(original_prompt) if len(original_prompt) < 60 else "General Conversation"
+        return heading, create_default_classification()
+
+def clean_heading(heading):
+    """Clean and format heading text"""
+    if not heading:
+        return "General Conversation"
+    
+    heading = heading.strip()
+    
+    # Remove surrounding quotes
+    if (heading.startswith('"') and heading.endswith('"')) or (heading.startswith("'") and heading.endswith("'")):
+        heading = heading[1:-1]
+    
+    # Remove common prefixes
+    prefixes_to_remove = [
+        "TITLE:", "HEADING:", "SUBJECT:", "TOPIC:", "TITLE -", "HEADING -", 
+        "SUBJECT -", "TOPIC -", "CHAT:", "CONVERSATION:", "DISCUSSION:", "Title Suggestion"
+    ]
+    
+    for prefix in prefixes_to_remove:
+        if heading.upper().startswith(prefix):
+            heading = heading[len(prefix):].strip()
+            break
+    
+    # Handle classification types that shouldn't be headings
+    classification_replacements = {
+        'GREETING': 'Welcome Chat',
+        'GRATITUDE': 'Thanks and Gratitude', 
+        'CAPABILITY': 'Assistant Help',
+        'WILDLIFE_TECHNICAL': 'Wildlife Discussion',
+        'CONSERVATION_TECHNICAL': 'Conservation Talk',
+        'GENERAL_ENVIRONMENTAL': 'Environmental Chat',
+        'OFF_TOPIC': 'General Conversation'
+    }
+    
+    heading_upper = heading.upper()
+    if heading_upper in classification_replacements:
+        heading = classification_replacements[heading_upper]
+    
+    # Truncate if too long  
+    if len(heading) > 60:
+        heading = heading[:57] + "..."
+    
+    return heading or "General Conversation"
+def generate_heading_from_mistral_fallback(prompt):
+    """Fallback method for heading generation only"""
+    heading_prompt = f"Generate a short, friendly conversation title for this message (NOT the classification type): {prompt}"
     
     try:
         response = make_model_request(heading_prompt, stream=False)
         if hasattr(response, 'json'):
-            heading = response.json().get("response", "").strip()
+            response_text = response.json().get('response', 'General Conversation')
         else:
-            # For OpenAI responses, the content is directly available
-            heading = response.strip()
+            response_text = str(response)
         
-        # Remove surrounding single or double quotes if present
-        if (heading.startswith('"') and heading.endswith('"')) or (heading.startswith("'") and heading.endswith("'")):
-            heading = heading[1:-1].strip()
+        return clean_heading(response_text.strip())
         
-        # Remove common prefixes that might be added by the AI
-        prefixes_to_remove = [
-            "Title:", "Heading:", "Subject:", "Topic:", "Title -", "Heading -", 
-            "Subject -", "Topic -", "Chat:", "Conversation:", "Discussion:"
-        ]
-        
-        for prefix in prefixes_to_remove:
-            if heading.lower().startswith(prefix.lower()):
-                heading = heading[len(prefix):].strip()
-                break
-        
-        # Remove any leading dashes, colons, or spaces
-        heading = heading.lstrip("- :").strip()
-        
-        # Ensure it's not empty and has reasonable length
-        if not heading or len(heading) < 3:
-            return "General Conversation"
-        
-        # Limit length to avoid overly long titles
-        if len(heading) > 60:
-            heading = heading[:57] + "..."
-        
-        return heading
     except Exception as e:
         logging.error(f"Failed to generate heading using model: {e}")
-        return "General Conversation"  # Return default heading if generation fails
+        # Smart fallback based on question content
+        if is_obvious_greeting(prompt):
+            return "Welcome Chat"
+        elif is_obvious_gratitude(prompt):
+            return "Thanks and Gratitude"
+        elif is_obvious_capability(prompt):
+            return "Assistant Help"
+        else:
+            return "General Conversation"
 
-# Question classification constants
-QUESTION_TYPES = {
-    'GREETING': 'greeting',
-    'GRATITUDE': 'gratitude',
-    'CAPABILITY': 'capability', 
-    'WILDLIFE_TECHNICAL': 'wildlife_technical',
-    'CONSERVATION_TECHNICAL': 'conservation_technical',
-    'GENERAL_ENVIRONMENTAL': 'general_environmental',
-    'OFF_TOPIC': 'off_topic'
-}
-
-def classify_question_with_ai(question):
-    """Use AI to classify ambiguous questions with confidence scoring and mixed intent detection"""
+def classify_question_with_ai_fallback(question):
+    """Fallback method for classification only"""
     classification_prompt = f"""
     Analyze the following question and provide:
     1. Primary category classification
@@ -493,13 +735,39 @@ def classify_question_with_ai(question):
         if hasattr(response, 'json'):
             response_text = response.json().get("response", "").strip()
         else:
-            # For OpenAI responses, the content is directly available
             response_text = response.strip()
         return parse_enhanced_classification(response_text)
         
     except Exception as e:
         logging.warning(f"AI classification failed due to model unavailability: {e}")
         return create_default_classification()
+
+def generate_heading_from_mistral(prompt):
+    """Enhanced function - now uses combined approach with fallback"""
+    heading, _ = generate_heading_and_classify_combined_fast(prompt)
+    return heading
+
+# Question classification constants
+QUESTION_TYPES = {
+    'GREETING': 'greeting',
+    'GRATITUDE': 'gratitude',
+    'CAPABILITY': 'capability', 
+    'WILDLIFE_TECHNICAL': 'wildlife_technical',
+    'CONSERVATION_TECHNICAL': 'conservation_technical',
+    'GENERAL_ENVIRONMENTAL': 'general_environmental',
+    'OFF_TOPIC': 'off_topic'
+}
+
+def classify_question_with_ai(question, use_combined=False):
+    """Use AI to classify ambiguous questions with confidence scoring and mixed intent detection"""
+    
+    # If combined approach is requested and this is for a new conversation, use it
+    if use_combined:
+        _, classification_result = generate_heading_and_classify_combined_fast(question)
+        return classification_result
+    
+    # Otherwise use the traditional classification-only approach
+    return classify_question_with_ai_fallback(question)
 
 def parse_enhanced_classification(response_text):
     """Parse the enhanced AI classification response"""
@@ -661,7 +929,7 @@ def is_obvious_capability(text):
     return False
 
 def intelligent_question_classifier(question, conversation_history=None):
-    """Enhanced hybrid approach with mixed intent detection and pronoun resolution"""
+    """AI-first hybrid approach with fast pattern matching fallbacks for accuracy"""
     
     # Step 1: Basic pronoun resolution if conversation history available
     resolved_question = question
@@ -670,46 +938,70 @@ def intelligent_question_classifier(question, conversation_history=None):
         if resolved_question != question:
             logging.info(f"Pronoun resolution: '{question}' -> '{resolved_question}'")
     
-    # Step 2: Check for mixed intent patterns first (gratitude + technical content)
+    # Step 2: Try AI classification first for best accuracy
+    try:
+        logging.info(f"🤖 Attempting AI classification for: '{question}'")
+        ai_result = classify_question_with_ai(resolved_question)
+        
+        # If AI classification succeeds and has reasonable confidence, use it
+        if ai_result and ai_result.get('confidence', 0) >= 60:
+            logging.info(f"✅ AI classification successful: {ai_result['primary_type']} (confidence: {ai_result['confidence']}%)")
+            
+            # Enhanced mixed intent detection using pattern matching to supplement AI
+            has_gratitude = is_obvious_gratitude(question)
+            has_greeting = is_obvious_greeting(question) and not has_gratitude
+            has_capability = is_obvious_capability(question)
+            has_technical = is_obvious_technical(question)
+            
+            # If AI didn't detect mixed intent but patterns suggest it, enhance the result
+            if not ai_result.get('is_mixed', False) and ((has_gratitude or has_greeting) and has_technical):
+                logging.info(f"🔍 Pattern matching detected mixed intent that AI missed")
+                ai_result['is_mixed'] = True
+                ai_result['secondary_types'] = [QUESTION_TYPES['GRATITUDE'] if has_gratitude else QUESTION_TYPES['GREETING']]
+                ai_result['context_hint'] = 'ai_enhanced_mixed_intent'
+            
+            return {
+                'type': ai_result['primary_type'],
+                'confidence': ai_result['confidence'],
+                'is_mixed': ai_result.get('is_mixed', False),
+                'secondary_types': ai_result.get('secondary_types', []),
+                'context_hint': ai_result.get('context_hint', 'ai_primary')
+            }
+        else:
+            logging.warning(f"⚠️ AI classification low confidence ({ai_result.get('confidence', 0)}%), falling back to pattern matching")
+    
+    except Exception as e:
+        logging.warning(f"❌ AI classification failed: {e}, falling back to pattern matching")
+    
+    # Step 3: Fallback to fast pattern matching if AI fails or has low confidence
+    logging.info(f"🔄 Using pattern matching fallback for: '{question}'")
+    
     has_gratitude = is_obvious_gratitude(question)
     has_greeting = is_obvious_greeting(question) and not has_gratitude  # Don't double-count "thanks"
     has_capability = is_obvious_capability(question)
     has_technical = is_obvious_technical(question)
     
     # Debug logging for classification
-    logging.info(f"Classification debug for '{question}': gratitude={has_gratitude}, greeting={has_greeting}, capability={has_capability}, technical={has_technical}")
+    logging.info(f"Pattern matching debug for '{question}': gratitude={has_gratitude}, greeting={has_greeting}, capability={has_capability}, technical={has_technical}")
     
     # Handle mixed intent cases where gratitude/greeting is combined with technical questions
     if (has_gratitude or has_greeting) and has_technical:
-        logging.info(f"Mixed intent detected: {'gratitude' if has_gratitude else 'greeting'} + technical")
-        # This is a mixed intent question - prioritize the technical aspect
-        ai_result = classify_question_with_ai(resolved_question)
-        if ai_result['primary_type'] in [QUESTION_TYPES['WILDLIFE_TECHNICAL'], QUESTION_TYPES['CONSERVATION_TECHNICAL']]:
-            return {
-                'type': ai_result['primary_type'],
-                'confidence': min(ai_result['confidence'], 85),  # Slightly lower confidence for mixed intent
-                'is_mixed': True,
-                'secondary_types': [QUESTION_TYPES['GRATITUDE'] if has_gratitude else QUESTION_TYPES['GREETING']],
-                'context_hint': 'mixed_gratitude_technical'
-            }
-        else:
-            # If AI doesn't classify it as technical but we detected technical keywords, force wildlife technical
-            logging.info(f"AI classified as {ai_result['primary_type']}, but forcing WILDLIFE_TECHNICAL due to mixed intent detection")
-            return {
-                'type': QUESTION_TYPES['WILDLIFE_TECHNICAL'],
-                'confidence': 80,
-                'is_mixed': True,
-                'secondary_types': [QUESTION_TYPES['GRATITUDE'] if has_gratitude else QUESTION_TYPES['GREETING']],
-                'context_hint': 'mixed_technical_forced'
-            }
+        logging.info(f"Mixed intent detected via patterns: {'gratitude' if has_gratitude else 'greeting'} + technical")
+        return {
+            'type': QUESTION_TYPES['WILDLIFE_TECHNICAL'],  # Prioritize technical aspect
+            'confidence': 80,
+            'is_mixed': True,
+            'secondary_types': [QUESTION_TYPES['GRATITUDE'] if has_gratitude else QUESTION_TYPES['GREETING']],
+            'context_hint': 'pattern_mixed_intent'
+        }
     
-    # Step 3: Single intent fast checks (only if no mixed intent detected)
+    # Single intent pattern matches
     if has_greeting and not has_technical:
         return {
             'type': QUESTION_TYPES['GREETING'],
             'confidence': 95,
             'is_mixed': False,
-            'context_hint': 'fast_greeting'
+            'context_hint': 'pattern_greeting'
         }
     
     if has_gratitude and not has_technical:
@@ -717,7 +1009,7 @@ def intelligent_question_classifier(question, conversation_history=None):
             'type': QUESTION_TYPES['GRATITUDE'],
             'confidence': 95,
             'is_mixed': False,
-            'context_hint': 'fast_gratitude'
+            'context_hint': 'pattern_gratitude'
         }
     
     if has_capability and not has_technical:
@@ -725,34 +1017,24 @@ def intelligent_question_classifier(question, conversation_history=None):
             'type': QUESTION_TYPES['CAPABILITY'],
             'confidence': 95,
             'is_mixed': False,
-            'context_hint': 'fast_capability'
+            'context_hint': 'pattern_capability'
         }
     
     if has_technical and not (has_gratitude or has_greeting or has_capability):
-        # Pure technical question
-        ai_result = classify_question_with_ai(resolved_question)
-        if ai_result['primary_type'] in [QUESTION_TYPES['WILDLIFE_TECHNICAL'], QUESTION_TYPES['CONSERVATION_TECHNICAL']]:
-            return {
-                'type': ai_result['primary_type'],
-                'confidence': min(ai_result['confidence'], 90),
-                'is_mixed': ai_result['is_mixed'],
-                'context_hint': 'technical_with_ai'
-            }
-        else:
-            return {
-                'type': QUESTION_TYPES['WILDLIFE_TECHNICAL'],
-                'confidence': 75,
-                'is_mixed': False,
-                'context_hint': 'technical_fallback'
-            }
+        return {
+            'type': QUESTION_TYPES['WILDLIFE_TECHNICAL'],
+            'confidence': 85,
+            'is_mixed': False,
+            'context_hint': 'pattern_technical'
+        }
     
-    # Step 4: For ambiguous cases, use full AI classification
-    ai_result = classify_question_with_ai(resolved_question)
+    # Step 4: Ultimate fallback for ambiguous cases
+    logging.info(f"🤷 No clear pattern match, using default classification")
     return {
-        'type': ai_result['primary_type'],
-        'confidence': ai_result['confidence'],
-        'is_mixed': ai_result['is_mixed'],
-        'context_hint': 'ai_classification'
+        'type': QUESTION_TYPES['GENERAL_ENVIRONMENTAL'],
+        'confidence': 60,
+        'is_mixed': False,
+        'context_hint': 'default_fallback'
     }
 
 def is_obvious_gratitude(text):
@@ -840,7 +1122,8 @@ def is_obvious_technical(text):
 def should_use_context(classification_result):
     """Determine if context retrieval is needed based on classification result"""
     if isinstance(classification_result, dict):
-        question_type = classification_result['type']
+        # Handle both 'type' and 'primary_type' keys for compatibility
+        question_type = classification_result.get('type') or classification_result.get('primary_type', QUESTION_TYPES['GENERAL_ENVIRONMENTAL'])
         confidence = classification_result.get('confidence', 70)
         is_mixed = classification_result.get('is_mixed', False)
     else:
@@ -904,6 +1187,10 @@ def ask_question_with_stream_route():
         user_question = request.args.get("question")
         user_id = request.args.get("user_id")
         chat_id = request.args.get("chat_id")
+        
+        # Initialize classification variables
+        classification_already_done = False
+        classification_result = None
 
         print(f"🔍 DEBUG: Received parameters - user_id: {user_id}, chat_id: {chat_id}, question: {user_question}")
         
@@ -988,7 +1275,18 @@ def ask_question_with_stream_route():
                 # If chat_id was provided but chat doesn't exist, create a new chat with the provided ID
                 # This handles cases where frontend has a chat_id but backend lost the data
                 logging.warning(f"Chat {chat_id} not found for user {user_id}, creating new chat with provided ID")
-                heading = generate_heading_from_mistral(user_question)
+                
+                if should_use_combined_calls():
+                    # Use combined approach for efficiency - get both heading and classification in one call
+                    heading, classification_result = generate_heading_and_classify_combined_fast(user_question)
+                    classification_already_done = True
+                    logging.info(f"🚀 EFFICIENCY: Used combined AI call for new chat {chat_id} - got heading '{heading}' and classification '{classification_result['type']}' in single request")
+                else:
+                    # Use traditional separate calls
+                    heading = generate_heading_from_mistral_fallback(user_question)
+                    classification_already_done = False
+                    logging.info(f"🔄 TRADITIONAL: Used separate AI call for heading generation")
+                
                 chat = {
                     "chat_id": chat_id,
                     "user_id": user_id,
@@ -1001,7 +1299,19 @@ def ask_question_with_stream_route():
                 # Only create new chat if no chat_id was provided (new conversation)
                 chat_id = str(uuid.uuid4())
                 logging.info(f"Creating new chat with ID: {chat_id}")
-                heading = generate_heading_from_mistral(user_question)
+                
+                if should_use_combined_calls():
+                    # Use combined approach for efficiency - get both heading and classification in one call
+                    heading, classification_result = generate_heading_and_classify_combined_fast(user_question)
+                    classification_already_done = True
+                    result_type = classification_result.get('type') or classification_result.get('primary_type', 'unknown')
+                    logging.info(f"🚀 EFFICIENCY: Used combined AI call for new chat {chat_id} - got heading '{heading}' and classification '{result_type}' in single request")
+                else:
+                    # Use traditional separate calls
+                    heading = generate_heading_from_mistral_fallback(user_question)
+                    classification_already_done = False
+                    logging.info(f"🔄 TRADITIONAL: Used separate AI call for heading generation")
+                
                 chat = {
                     "chat_id": chat_id,
                     "user_id": user_id,
@@ -1010,17 +1320,33 @@ def ask_question_with_stream_route():
                     "created_at": datetime.utcnow().isoformat()
                 }
                 store_chat(user_id, chat_id, heading, chat["messages"])
+        else:
+            # Existing chat - only need classification
+            classification_already_done = False
 
         chat_heading = chat["heading"]
         conversation_history = chat["messages"]
         conversation_history.append({"role": "user", "content": user_question})
 
-        print("🔥 DEBUG: About to start question classification...")
+        print(f"🔥 DEBUG: About to start question classification...")
         print(f"🔥 DEBUG: Question to classify: '{user_question}'")
         
         # Enhanced intelligent question classification with mixed intent detection
-        classification_result = intelligent_question_classifier(user_question, conversation_history[:-1])
-        question_type = classification_result['type'] if isinstance(classification_result, dict) else classification_result
+        if not classification_already_done:
+            logging.info(f"🔍 Starting question classification...")
+            print(f"🔍 Starting question classification...")
+            classification_start_time = time.time()
+            classification_result = intelligent_question_classifier(user_question, conversation_history[:-1])
+            classification_elapsed = time.time() - classification_start_time
+            logging.info(f"✅ Question classification completed in {classification_elapsed:.2f}s")
+            print(f"✅ Question classification completed in {classification_elapsed:.2f}s")
+        # else: classification_result is already set from combined call above
+        
+        # Extract question type from classification result (handle both 'type' and 'primary_type' keys for compatibility)
+        if isinstance(classification_result, dict):
+            question_type = classification_result.get('type') or classification_result.get('primary_type', QUESTION_TYPES['GENERAL_ENVIRONMENTAL'])
+        else:
+            question_type = classification_result
         
         print(f"🎯 DEBUG: Classification completed - Type: {question_type}")
         print(f"🎯 DEBUG: Full result: {classification_result}")
@@ -1033,6 +1359,19 @@ def ask_question_with_stream_route():
             print(f"📝 QUESTION CLASSIFICATION RESULTS")
             logging.info(f"   Question: '{user_question}'")
             print(f"   Question: '{user_question}'")
+            
+            # Show efficiency information
+            if classification_already_done:
+                logging.info(f"   ⚡ EFFICIENCY: Used combined AI call (1 request for heading + classification)")
+                print(f"   ⚡ EFFICIENCY: Used combined AI call (1 request for heading + classification)")
+            else:
+                if should_use_combined_calls():
+                    logging.info(f"   🔄 STANDARD: Used traditional separate classification (existing chat)")
+                    print(f"   🔄 STANDARD: Used traditional separate classification (existing chat)")
+                else:
+                    logging.info(f"   🔄 ADAPTIVE: Combined AI calls disabled/timed out - using separate classification")
+                    print(f"   🔄 ADAPTIVE: Combined AI calls disabled/timed out - using separate classification")
+                
             if isinstance(classification_result, dict):
                 logging.info(f"   ✅ Primary Category: {question_type.upper()}")
                 logging.info(f"   🎯 Confidence Score: {classification_result['confidence']}%")
@@ -1044,8 +1383,19 @@ def ask_question_with_stream_route():
                     logging.info(f"   📋 Secondary Categories: {', '.join(classification_result['secondary_types'])}")
                     print(f"   📋 Secondary Categories: {', '.join(classification_result['secondary_types'])}")
                 if classification_result.get('context_hint'):
-                    logging.info(f"   🔍 Classification Method: {classification_result['context_hint']}")
-                    print(f"   🔍 Classification Method: {classification_result['context_hint']}")
+                    method_description = {
+                        'ai_primary': '🤖 AI Classification (Primary)',
+                        'ai_enhanced_mixed_intent': '🤖 AI + Pattern Enhancement',
+                        'pattern_mixed_intent': '🔍 Pattern Matching (Mixed Intent)',
+                        'pattern_greeting': '🔍 Pattern Matching (Greeting)',
+                        'pattern_gratitude': '🔍 Pattern Matching (Gratitude)', 
+                        'pattern_capability': '🔍 Pattern Matching (Capability)',
+                        'pattern_technical': '🔍 Pattern Matching (Technical)',
+                        'default_fallback': '🤷 Default Fallback'
+                    }
+                    method = method_description.get(classification_result['context_hint'], classification_result['context_hint'])
+                    logging.info(f"   🔍 Classification Method: {method}")
+                    print(f"   🔍 Classification Method: {method}")
             else:
                 logging.info(f"   ✅ Category: {question_type.upper()}")
                 print(f"   ✅ Category: {question_type.upper()}")
@@ -1056,31 +1406,57 @@ def ask_question_with_stream_route():
             logging.error(f"❌ ERROR in classification logging: {e}")
         
         if should_use_context(classification_result):
+            logging.info(f"🔍 Context retrieval required for question type: {question_type}")
+            print(f"🔍 Context retrieval required for question type: {question_type}")
             # For technical questions, build retrieval query normally
             retrieval_query = build_retrieval_query(conversation_history[:-1], user_question, max_turns=MAX_HISTORY)
             logging.info(f"🔍 Building retrieval query for context search...")
             logging.info(f"   Query built from conversation history: {len(conversation_history[:-1])} previous messages")
             
             # Check if the question is asking about a specific sanctuary vs. general information
-            # First, check for general query patterns that should use all available context
-            general_query_patterns = [
-                r'\b(?:where are all|list all|all the|how many|what are all)\b.*?(?:tiger reserve|national park|wildlife sanctuary|sanctuary|reserve)',
-                r'\b(?:tell me about all|show me all|give me a list)\b.*?(?:tiger reserve|national park|wildlife sanctuary|sanctuary|reserve)',
-                r'\b(?:tiger reserves? in india|national parks in india|sanctuaries in india)\b'
+            # Instead of trying to match all possible question patterns, use semantic approach
+            
+            # First, check if question contains conservation/protected area keywords
+            conservation_keywords = [
+                'wildlife', 'sanctuary', 'sanctuaries', 'national park', 'national parks',
+                'reserve', 'reserves', 'protected area', 'protected areas', 'conservation',
+                'biodiversity', 'ecosystem', 'habitat', 'species protection', 'nature conservation',
+                'tiger reserve', 'bird sanctuary', 'marine sanctuary', 'biosphere reserve'
             ]
             
-            is_general_query = any(re.search(pattern, user_question.lower()) for pattern in general_query_patterns)
+            question_lower = user_question.lower()
+            has_conservation_keywords = any(keyword in question_lower for keyword in conservation_keywords)
+            
+            # Check for specific sanctuary pattern (looking for "Name + Type" format)
+            sanctuary_pattern = r'\b(?!(?:the|all|any|where|what|which|how|many)\b)([A-Za-z][A-Za-z\s]{2,}?)\s+(?:wls|wildlife sanctuary|national park|tiger reserve|biosphere reserve|sanctuary|park|reserve)\b'
+            sanctuary_matches = re.findall(sanctuary_pattern, question_lower)
+            sanctuary_matches = [match.strip() for match in sanctuary_matches if match.strip().lower() not in ['the', 'all', 'any', 'where', 'what', 'which', 'how', 'many', 'are', 'is']]
+            
+            # Check for general query indicators (multiple/all/list type words)
+            general_indicators = [
+                'all', 'list', 'many', 'several', 'multiple', 'various', 'different',
+                'types', 'categories', 'kinds', 'overview', 'summary', 'general',
+                'comprehensive', 'complete', 'total', 'entire', 'whole'
+            ]
+            has_general_indicators = any(indicator in question_lower for indicator in general_indicators)
+            
+            # Check for India context
+            has_india_context = 'india' in question_lower or 'indian' in question_lower
+            
+            # Determine if this should be treated as a general query
+            is_general_query = (
+                has_conservation_keywords and 
+                has_india_context and 
+                (has_general_indicators or not sanctuary_matches)
+            )
             
             if is_general_query:
-                logging.info(f"🌍 General query detected - will use all available context")
+                logging.info(f"🌍 General query detected based on semantic analysis:")
+                logging.info(f"   - Has conservation keywords: {has_conservation_keywords}")
+                logging.info(f"   - Has India context: {has_india_context}")
+                logging.info(f"   - Has general indicators: {has_general_indicators}")
+                logging.info(f"   - Specific sanctuary matches: {len(sanctuary_matches)}")
                 sanctuary_matches = []  # Don't treat as specific sanctuary query
-            else:
-                # Check if the question is asking about a specific sanctuary
-                # Improved pattern to avoid matching articles and common words, and require proper sanctuary names
-                sanctuary_pattern = r'\b(?!(?:the|all|any|where|what|which|how|many)\b)([A-Za-z][A-Za-z\s]{2,}?)\s+(?:wls|wildlife sanctuary|national park|tiger reserve|biosphere reserve|sanctuary|park|reserve)\b'
-                sanctuary_matches = re.findall(sanctuary_pattern, user_question.lower())
-                # Filter out obvious non-sanctuary matches
-                sanctuary_matches = [match.strip() for match in sanctuary_matches if match.strip().lower() not in ['the', 'all', 'any', 'where', 'what', 'which', 'how', 'many', 'are', 'is']]
             
             # More specific state pattern - only match after prepositions that indicate location
             state_pattern = r'\b(?:in|from|of|at)\s+([a-zA-Z]+(?:\s+[a-zA-Z]+)*?)(?:\s*[,.]|\s*$)'
@@ -1095,7 +1471,21 @@ def ask_question_with_stream_route():
             elif is_general_query:
                 logging.info(f"🌍 General information query - will provide comprehensive context")
             
-            context_metadatas = get_structured_context(retrieval_query)
+            logging.info(f"🔍 About to call get_structured_context with query length: {len(retrieval_query)}")
+            print(f"🔍 About to call get_structured_context with query length: {len(retrieval_query)}")
+            
+            try:
+                context_start_time = time.time()
+                context_metadatas = get_structured_context(retrieval_query)
+                context_elapsed = time.time() - context_start_time
+                
+                logging.info(f"✅ get_structured_context completed in {context_elapsed:.2f}s")
+                print(f"✅ get_structured_context completed in {context_elapsed:.2f}s")
+            except Exception as e:
+                context_elapsed = time.time() - context_start_time if 'context_start_time' in locals() else 0
+                logging.error(f"❌ get_structured_context failed after {context_elapsed:.2f}s: {e}")
+                print(f"❌ get_structured_context failed after {context_elapsed:.2f}s: {e}")
+                context_metadatas = []
             
             # Enhanced context retrieval logging
             logging.info("-" * 50)
@@ -1244,16 +1634,29 @@ def ask_question_with_stream_route():
         logging.info(f"   Conversation Length: {len(conversation_history)} messages")
         logging.info("=" * 60)
 
+        print(f"🎯 DEBUG: About to build prompt...")
+        logging.info("🎯 DEBUG: Building prompt for model request...")
         prompt = build_ollama_prompt(system_contexts, rag_context, conversation_history, classification_result)
+        print(f"🎯 DEBUG: Prompt built successfully, length: {len(prompt) if prompt else 0}")
+        logging.info(f"🎯 DEBUG: Prompt built successfully, length: {len(prompt) if prompt else 0}")
 
         def generate():
             buffer = ""
             try:
+                print(f"🎯 DEBUG: Starting generate() function...")
+                logging.info("🎯 DEBUG: Starting response generation...")
+                
                 # Send chat_id at the start of the stream
                 yield f"data: {json.dumps({'chat_id': chat_id})}\n\n"
                 
+                print(f"🎯 DEBUG: About to make model request...")
+                logging.info("🎯 DEBUG: Making model request...")
+                
                 # Use the unified model request method for streaming
                 response = make_model_request(prompt, stream=True)
+                
+                print(f"🎯 DEBUG: Model request completed, response type: {type(response)}")
+                logging.info(f"🎯 DEBUG: Model request completed, response type: {type(response)}")
                 
                 # Handle different response types (Ollama vs OpenAI streaming)
                 if hasattr(response, 'iter_lines'):
@@ -2052,4 +2455,13 @@ if __name__ == '__main__':
     print("🧪 STARTUP: Testing logging configuration...")
     logging.info("🧪 STARTUP: Logging is working correctly!")
     print("🧪 STARTUP: Starting Flask application...")
-    app.run(host="localhost", debug=True, port=5000)
+    
+    # Debug Flask configuration
+    print(f"🔧 DEBUG: Flask debug mode: {app.debug}")
+    print(f"🔧 DEBUG: Flask config ENV: {app.config.get('ENV', 'not set')}")
+    print(f"🔧 DEBUG: FLASK_ENV environment: {os.getenv('FLASK_ENV', 'not set')}")
+    print(f"🔧 DEBUG: FLASK_DEBUG environment: {os.getenv('FLASK_DEBUG', 'not set')}")
+    print(f"🔧 DEBUG: Werkzeug debug: {app.config.get('DEBUG', False)}")
+    print(f"🔧 DEBUG: Running in debug mode with pin...")
+    
+    app.run(host="127.0.0.1", debug=True, port=5000)
